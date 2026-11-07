@@ -1,0 +1,131 @@
+/*
+ * 結（yui）— Windows 用の受け皿
+ *
+ * 本体（yui.c）は POSIX の低水準 I/O で書いてあります
+ * （open / read / write / lseek / ftruncate / fsync / flock / fstat）。
+ * iOS と Android もその系統なので、本体は POSIX のままにして、
+ * Windows のときだけこの受け皿を通します。
+ *
+ * ★一番大事なのは _O_BINARY です。
+ *   付けないと MSVC の C ランタイムが改行を勝手に CRLF へ変換し、
+ *   結のファイル（バイナリ）が壊れます。open を包んでいるのはこのためです。
+ *
+ * ★ファイルの大きさは 2 GB までです（MSVC の struct stat の st_size が
+ *   32 ビットのため）。結は開くときに中身を全部メモリに読むので、
+ *   そもそもそれ以上は現実的ではありません。v0 ではこのままにします。
+ *
+ * ★ロック解除（LOCK_UN）は作っていません。本体が使っておらず、
+ *   閉じるときに自動で外れるためです。
+ */
+#ifndef YUI_WIN_H
+#define YUI_WIN_H
+#ifdef _WIN32
+
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+
+/*
+ * ★windows.h は 16 ビット時代の名残で near と far を「空のマクロ」として
+ *   定義します。そのままだと本体の `Str near = {0};` が `Str  = {0};` に
+ *   化けてコンパイルが通りません。今は誰も使わない名前なので打ち消します。
+ */
+#undef near
+#undef far
+
+#include <errno.h>
+#include <fcntl.h>
+#include <io.h>
+#include <stddef.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+
+/* POSIX の ssize_t。MSVC には無いので作ります。 */
+#ifndef _SSIZE_T_DEFINED
+#define _SSIZE_T_DEFINED
+typedef long long ssize_t;
+#endif
+
+/* flock の種類。本体が使うのはこの 2 つだけです。 */
+#define LOCK_EX 2
+#define LOCK_NB 4
+
+/*
+ * open の代わり。_O_BINARY を必ず足します（上の★）。
+ * mode（0644 など）は Windows には読み書きの区別しか無いので、
+ * 書き込みビットが立っていれば読み書き可として渡します。
+ */
+static int yui_win_open(const char *path, int flags, int mode) {
+    int pmode = (mode & 0200) ? (_S_IREAD | _S_IWRITE) : _S_IREAD;
+    return _open(path, flags | _O_BINARY, pmode);
+}
+
+/* read の代わり。size_t を Windows の unsigned int 幅に収めます。 */
+static ssize_t yui_win_read(int fd, void *buf, size_t n) {
+    unsigned int m = (n > 0x7fffffffu) ? 0x7fffffffu : (unsigned int)n;
+    return (ssize_t)_read(fd, buf, m);
+}
+
+/* write の代わり。本体は書けた分だけ進める作りなので、分割されても平気です。 */
+static ssize_t yui_win_write(int fd, const void *buf, size_t n) {
+    unsigned int m = (n > 0x7fffffffu) ? 0x7fffffffu : (unsigned int)n;
+    return (ssize_t)_write(fd, buf, m);
+}
+
+/*
+ * ftruncate の代わり。_chsize_s は失敗を戻り値で返すので、
+ * POSIX と同じ「-1 を返して errno に入れる」形に直します。
+ */
+static int yui_win_ftruncate(int fd, long long len) {
+    errno_t e = _chsize_s(fd, (__int64)len);
+    if (e != 0) {
+        errno = e;
+        return -1;
+    }
+    return 0;
+}
+
+/*
+ * flock の代わり。Windows にはファイル全体を 1 つ押さえる仕組みが無いので、
+ * 先頭から取れる限りの範囲（0xFFFFFFFFFFFFFFFF）に排他ロックをかけます。
+ * LOCK_NB のときは待たずにすぐ失敗させます。
+ */
+static int yui_win_flock(int fd, int op) {
+    HANDLE h = (HANDLE)_get_osfhandle(fd);
+    OVERLAPPED ov;
+    DWORD flags = LOCKFILE_EXCLUSIVE_LOCK;
+    if (h == INVALID_HANDLE_VALUE) {
+        errno = EBADF;
+        return -1;
+    }
+    if (op & LOCK_NB) flags |= LOCKFILE_FAIL_IMMEDIATELY;
+    memset(&ov, 0, sizeof ov);
+    if (!LockFileEx(h, flags, 0, 0xFFFFFFFFu, 0xFFFFFFFFu, &ov)) {
+        errno = EWOULDBLOCK;
+        return -1;
+    }
+    return 0;
+}
+
+/*
+ * 本体の呼び出しをそのまま使えるように名前を合わせます。
+ * ここより上で標準ヘッダを読み終えているので、ヘッダの宣言を
+ * 置き換えてしまう心配はありません。
+ */
+#define open      yui_win_open
+#define read      yui_win_read
+#define write     yui_win_write
+#define ftruncate yui_win_ftruncate
+#define flock     yui_win_flock
+#define fsync     _commit
+#define lseek     _lseeki64
+#define close     _close
+#define isatty    _isatty
+/*
+ * fstat と struct stat は MSVC の <sys/stat.h> がそのまま用意してくれるので、
+ * ここでは置き換えません（_fstat に替えると struct の型が合わず警告になります）。
+ */
+
+#endif /* _WIN32 */
+#endif /* YUI_WIN_H */

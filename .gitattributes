@@ -1,0 +1,22 @@
+# このリポジトリの改行の決めごと
+#
+# ★この PC の git は core.autocrlf=true（system 設定）です。
+#   何も書かないとチェックアウト時に CRLF になり、Makefile と
+#   シェルスクリプトが Linux・macOS 側で動かなくなります。
+#   なので、ここで LF に固定します。
+#
+# .bat は Windows のコマンドプロンプトが読むので CRLF のままにします。
+
+* text=auto eol=lf
+
+*.c        text eol=lf
+*.h        text eol=lf
+*.md       text eol=lf
+*.sh       text eol=lf
+Makefile   text eol=lf
+.gitignore text eol=lf
+
+*.bat      text eol=crlf
+
+# 結のデータファイルはバイナリです（改行を変換されると壊れます）
+*.yui      binary
