@@ -1,8 +1,9 @@
 # テスト
 
 ```
-make test        Linux / macOS
-build.bat test   Windows
+make test        Linux / macOS（ライブラリと CLI）
+make test-cli    CLI だけ
+build.bat test   Windows（ライブラリだけ。CLI は CI で見ています）
 make test-san    AddressSanitizer / UBSan つき
 make test-wasm   wasm（emscripten）。emcc と node が要ります
 ```
@@ -16,9 +17,14 @@ GitHub Actions で、push のたびに **Linux（gcc / clang）・macOS・Window
 |---|---|
 | `cases/*.txt` | 問い合わせの言葉と、その出力 |
 | `test_yui.c` の後半 | 問い合わせでは作れない状況（壊れたファイル・二重オープン・開けないパス） |
+| `cli.sh` | CLI だけのもの（終了コード・標準入力の読み方） |
 
 **まだ見ていないもの**は、流すたびに `-- 見ていません:` の行で出ます。
-いまは CLI（`yui_cli.c`）の振る舞い・`詰め直す` の失敗の道・wasm での排他がそれです。
+いまは CLI の対話（端末）の道・`詰め直す` の失敗の道・wasm での排他がそれです。
+
+★`cli.sh` は `sh` が要るので **Windows では動きません**。CI の Windows では
+`.github/workflows/ci.yml` の pwsh の段が同じことを見ています。
+**同じものを 2 箇所に書いているので、片方を直したらもう片方も直してください。**
 
 ## ケースの書き方
 

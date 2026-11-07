@@ -71,23 +71,43 @@ static int print_row(void *ctx, int kind, const char *text) {
     return 0;
 }
 
-/* 1 行読む。長さの制限はありません。入力が尽きたら NULL */
-static char *read_line(FILE *f) {
-    size_t cap = 4096, n = 0;
+/*
+ * 1 行読む。長さの制限はありません。入力が尽きたら NULL。
+ * *len に読んだバイト数を入れます（終わりの改行を含む）。
+ *
+ * ★NUL（文字コード 0）も読み落としません。1 バイトずつ読んでいるのはこのためです。
+ *   古い版は fgets と strlen で組んでいたので、行の途中に NUL があると
+ *   「そこまでが読めた長さ」と数えてしまい、次の fgets が NUL の位置から
+ *   上書きして、次の行を巻き込んでいました。
+ *   実測（古い版・2 行 渡した）:
+ *     作る (点:甲 {本文: "x<NUL>y"})
+ *     作る (点:乙)
+ *   → 「文字列が閉じていません」1 つだけ出て、一覧 は 0 件。
+ *     2 行目の 作る が黙って消えていました。
+ *   NUL が入っていること自体は呼ぶ側（main）が見ます。長さが分かれば数えられます。
+ */
+static char *read_line(FILE *f, size_t *len) {
+    size_t cap = 256, n = 0;
     char *b = malloc(cap);
+    int c;
     if (!b) abort();
-    while (fgets(b + n, (int)(cap - n), f)) {
-        n += strlen(b + n);
-        if (n && b[n - 1] == '\n') return b;
-        if (n + 1 >= cap) {
+    *len = 0;
+    while ((c = fgetc(f)) != EOF) {
+        if (n + 2 > cap) {
             cap *= 2;
             b = realloc(b, cap);
             if (!b) abort();
         }
+        b[n++] = (char)c;
+        if (c == '\n') break;
     }
-    if (n) return b;
-    free(b);
-    return NULL;
+    if (!n) {
+        free(b);
+        return NULL;
+    }
+    b[n] = 0;
+    *len = n;
+    return b;
 }
 
 int main(int argc, char **argv) {
@@ -121,6 +141,8 @@ int main(int argc, char **argv) {
             failed = 1;
         }
     } else {
+        size_t len;
+        unsigned long lineno = 0;
         tty = isatty(0);
         if (tty) printf("結 yui %s（「手引き」で使い方、「終わる」で終了）\n", YUI_VERSION);
         for (;;) {
@@ -128,14 +150,39 @@ int main(int argc, char **argv) {
                 fputs("yui> ", stdout);
                 fflush(stdout);
             }
-            line = read_line(stdin);
+            line = read_line(stdin, &len);
             if (!line) break;
+            lineno++;
+            /*
+             * ★NUL が入っていたら、ここで止めて行とバイトの位置を言います。
+             *   yui_exec は C の文字列（NUL で終わる）を取るので、渡しても
+             *   NUL までしか見てもらえません。本体からは「引用符が閉じないまま
+             *   入力が尽きた」としか見えず、理由の分からないエラーになります。
+             *   どこに NUL があるかを知っているのは、バイト数で読んだここだけです。
+             */
+            if (strlen(line) != len) {
+                fflush(stdout);
+                fprintf(stderr,
+                        "エラー: %lu 行目の %lu バイト目に NUL（文字コード 0）が"
+                        "入っています。問い合わせに NUL は書けません\n",
+                        lineno, (unsigned long)strlen(line) + 1);
+                failed = 1;
+                free(line);
+                continue; /* この行だけ飛ばして、次の行へ進みます */
+            }
             rc = yui_exec(db, line, print_row, NULL);
             free(line);
             if (rc == YUI_ERROR) {
                 fflush(stdout);
-                fprintf(stderr, "エラー: %s\n", yui_errmsg(db));
+                /* ★行番号は、流し込みのときだけ出します。
+                 *   対話では「1 行目」と言われても手がかりになりません。 */
+                if (tty) fprintf(stderr, "エラー: %s\n", yui_errmsg(db));
+                else fprintf(stderr, "エラー: %lu 行目: %s\n", lineno, yui_errmsg(db));
                 failed = 1;
+                /* ★止めません。次の行へ進みます。300 行 流して 1 行 間違っていた
+                 *   ときに、残りを全部 捨てるほうが困るためです。
+                 *   どこで何が起きたかは、上の行番号で分かります。
+                 *   終了コードは 1 になるので、通ったかどうかは呼ぶ側で見られます。 */
             } else if (rc == YUI_END) {
                 break;
             }

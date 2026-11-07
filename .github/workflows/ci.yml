@@ -96,6 +96,39 @@ jobs:
           Write-Host $out
           if ($out -notmatch "人:田中") { throw "引数で渡した日本語が通っていません" }
 
+      # ★tests/cli.sh と同じことを見ています（あちらは sh が要るので Windows で動きません）。
+      #   片方を直したら、もう片方も直してください。
+      - name: CLI の終了コードと標準入力の読み方
+        shell: pwsh
+        run: |
+          [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+          # 終了コード
+          .\yui.exe 2>$null | Out-Null
+          if ($LASTEXITCODE -ne 2) { throw "引数が無いとき 2 を返しません（rc=$LASTEXITCODE）" }
+          .\yui.exe cli.yui "一覧 ()" | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "成功で 0 を返しません（rc=$LASTEXITCODE）" }
+          .\yui.exe cli.yui "これは誤り" 2>$null | Out-Null
+          if ($LASTEXITCODE -ne 1) { throw "失敗で 1 を返しません（rc=$LASTEXITCODE）" }
+          # 誤りの行があっても止まらず、何行目かを出す
+          "作る (点:一)`nこれは誤り`n作る (点:三)" | Set-Content -Path in1.txt -Encoding utf8NoBOM
+          $err = (Get-Content in1.txt -Raw | .\yui.exe cli2.yui) 2>&1 | Out-String
+          if ($err -notmatch "2 行目") { throw "何行目で失敗したかが出ていません: $err" }
+          $left = (.\yui.exe cli2.yui "一覧 (点:) 名前だけ" | Out-String)
+          if ($left -notmatch "点:一" -or $left -notmatch "点:三") {
+            throw "誤りの行の前後が実行されていません: $left"
+          }
+          # NUL が入った行は、その行だけ飛ばして次へ進む
+          $b = [Text.Encoding]::UTF8.GetBytes('作る (点:甲 {本文: "x')
+          $b += 0
+          $b += [Text.Encoding]::UTF8.GetBytes("y`"})`n作る (点:乙)`n")
+          [IO.File]::WriteAllBytes("$PWD\in2.txt", $b)
+          $err = (Get-Content in2.txt -Raw | .\yui.exe cli3.yui) 2>&1 | Out-String
+          if ($err -notmatch "NUL") { throw "NUL だと言っていません: $err" }
+          if ($err -notmatch "1 行目") { throw "NUL のある行が出ていません: $err" }
+          $left = (.\yui.exe cli3.yui "一覧 (点:) 名前だけ" | Out-String)
+          if ($left -notmatch "点:乙") { throw "NUL の次の行が巻き込まれています: $left" }
+          Write-Host "CLI: 通りました"
+
       - name: 土台をまたぐ比較用のファイルを作る
         run: type tests\compat.txt | .\yui.exe compat.yui
 

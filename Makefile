@@ -2,7 +2,8 @@
 # Windows は build.bat を使ってください（MSVC）。
 #
 #   make              yui を作る
-#   make test         テストを流す
+#   make test         テストを流す（ライブラリと CLI）
+#   make test-cli     CLI だけ流す
 #   make test-san     AddressSanitizer / UBSan を付けてテストを流す
 #   make test-wasm    wasm（emscripten）でテストを流す。emcc と node が要ります
 #   make san          sanitizer 付きの yui を作る
@@ -37,7 +38,7 @@ build:
 # ------------------------------------------------------------------
 # テスト
 #   ケースは tests/cases/*.txt。書き方は tests/README.md。
-#   CLI（yui_cli.c）はまだ通していません。見ているのはライブラリの側です。
+#   CLI（yui_cli.c）は tests/cli.sh が見ます（終了コードと標準入力の読み方）。
 # ------------------------------------------------------------------
 
 build/yui_test: yui.c tests/test_yui.c yui.h | build
@@ -49,11 +50,17 @@ build/yui_test_san: yui.c tests/test_yui.c yui.h | build
 build/yui_test.js: yui.c tests/test_yui.c yui.h | build
 	$(EMCC) -std=c99 -O2 $(WASM) $(TESTDEF) -o $@ yui.c tests/test_yui.c
 
-test: build/yui_test
+test: build/yui_test yui
 	./build/yui_test $(CASES)
+	sh tests/cli.sh ./yui
 
-test-san: build/yui_test_san
+test-san: build/yui_test_san build/yui_san
 	./build/yui_test_san $(CASES)
+	sh tests/cli.sh ./build/yui_san
+
+# CLI だけ流す
+test-cli: yui
+	sh tests/cli.sh ./yui
 
 test-wasm: build/yui_test.js
 	node build/yui_test.js $(CASES)
@@ -70,4 +77,4 @@ record: build/yui_test
 clean:
 	rm -rf build yui yui_test_tmp.yui yui_test_tmp.yui.断片 yui_test_tmp.yui.詰
 
-.PHONY: all san test test-san test-wasm record clean
+.PHONY: all san test test-san test-cli test-wasm record clean
