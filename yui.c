@@ -1093,7 +1093,8 @@ static void emit_str(yui *db, Str *o) {
     str_clear(o);
 }
 static void emit_count(yui *db, size_t n, const char *suffix) {
-    char b[80];
+    /* ★手がかり（label_hint）を添えることがあるので、短い桁では足りません */
+    char b[256];
     snprintf(b, sizeof b, "%llu 件%s", (unsigned long long)n, suffix);
     emit(db, YUI_SUMMARY, b);
 }
@@ -1627,6 +1628,43 @@ static void emit_doc(yui *db, u64 doc) {
     free(o.p);
 }
 
+/*
+ * 0 件だったときの手がかり。探した文字が点のラベルに当たるなら、その旨を out に書く。
+ * 書いたら 1、当たらなければ 0 を返す。
+ *
+ * ★当たったラベルは 1 つだけ出します（たいてい 1 つで、並べると締めの行が読めなくなります）。
+ * ★線の種類は見ません。ラベルは種類ごとに 1 つ覚えているので数が少なく、
+ *   走るのが安いのですが、線の種類は覚えていないので線を全部 見ることになります。
+ *   線が何万本もあるファイルでは、外した 探す だけが遅くなります。
+ *   同じ迷いは線でも起きるので、覚える形を変えるなら、そのとき一緒に直します。
+ */
+static int label_hint(yui *db, const char *q, char *out, size_t outn) {
+    u32 *qc;
+    size_t qn = fold_text(q, &qc), i;
+    int found = 0;
+    for (i = 0; i < db->m_label.nb && !found; i++) {
+        Entry *e;
+        for (e = db->m_label.b[i]; e; e = e->next) {
+            size_t j;
+            int live = 0;
+            if (!text_has(e->key, qc, qn)) continue;
+            /* ★全部 消えたラベルでは知らせません。一覧 を薦めても 0 件になるので */
+            for (j = 0; j < e->list.n; j++)
+                if (db->nodes[e->list.v[j] - 1].live) {
+                    live = 1;
+                    break;
+                }
+            if (!live) continue;
+            snprintf(out, outn, "（「%s」は点の種類です。一覧 (%s:) で引けます）", e->key,
+                     e->key);
+            found = 1;
+            break;
+        }
+    }
+    free(qc);
+    return found;
+}
+
 static int cmd_search(P *p) {
     yui *db = p->db;
     char *q;
@@ -1636,6 +1674,7 @@ static int cmd_search(P *p) {
     Vec hits = {0};
     NodePat f;
     int has_filter = 0;
+    char hint[192];
     if (parse_text(p, &q, &quoted) != 0) return -1;
     if (!*q) return perr(p, "探す文字を書いてください（例: 探す \"既読\"）");
     if (peek(p) == '(') {
@@ -1665,20 +1704,29 @@ static int cmd_search(P *p) {
     for (i = 0; i < hits.n && !db->stopped; i++) {
         u64 doc = hits.v[i];
         if (has_filter) {
-            if (doc & 1) {
-                Edge *e = &db->edges[(doc >> 1) - 1];
-                if (!node_matches(&db->nodes[e->from - 1], &f) &&
-                    !node_matches(&db->nodes[e->to - 1], &f))
-                    continue;
-            } else if (!node_matches(&db->nodes[(doc >> 1) - 1], &f)) {
-                continue;
-            }
+            /* ★点の形を書いたら、返すのは点だけです。
+             *   古い版は線も残していました（線の端の点が絞りに当たれば通す作り）。
+             *   それだと (便)-[…]->(人) のような線は (便:) でも (人:) でも端が当たるので、
+             *   どう絞っても落ちません。「絞ったのに件数が減らない」形で静かに狂います。
+             *   書いたのは点の形なので、点だけ返すほうが読みどおりです。
+             *   線の属性を探したいときは、絞りを書かずに 探す "文字" とします。 */
+            if (doc & 1) continue;
+            if (!node_matches(&db->nodes[(doc >> 1) - 1], &f)) continue;
         }
         emit_doc(db, doc);
         count++;
     }
     free(hits.v);
-    emit_count(db, count, "");
+    /* ★0 件のときだけ、探した文字がラベルに当たらないか見ます。
+     *   探す が見るのは「点の名前・点の属性・線の属性」で、ラベルは見ません。
+     *   ラベルを索引に入れれば当たるようになりますが、同じラベルの点が
+     *   何万と並ぶファイルでは索引がその分だけ太ります。
+     *   メモリを増やさずに迷いを解くため、入れずに「知らせる」ことにしました。
+     *   0 件のときだけ走るので、当たっているときの速さには影響しません。 */
+    if (count == 0 && label_hint(db, q, hint, sizeof hint))
+        emit_count(db, count, hint);
+    else
+        emit_count(db, count, "");
     return 0;
 }
 
