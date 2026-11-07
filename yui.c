@@ -248,6 +248,18 @@ static const Show SHOW_ALL = {1, NULL, 0};
 /* 属性を 1 つも出さない指示。線の行の両端の点などに使う */
 static const Show NONE = {0, NULL, 0};
 
+/*
+ * 線の行（探す）や道の行（辿る）に出てくる点の属性をどう出すか。
+ *
+ * ★既定では出しません。線や道が主役の行で点の属性まで並べると、
+ *   1 行が長くなって形が読めなくなります。
+ * ★ただし 見せる で名前を挙げたときは、その属性だけ点にも出します。
+ *   「ある日のやり取りを、時刻と話者つきで並べる」が
+ *   辿る 1 本で書けるようにするためです。
+ * ★名前だけ のときは nkeys=0 なので、やはり何も出ません。
+ */
+static const Show *node_show(const Show *sh) { return sh->all ? &NONE : sh; }
+
 typedef struct {
     char *label, *name;
     Attr *attrs;
@@ -1119,10 +1131,9 @@ static void print_edge_step(Str *o, const Edge *e, int forward, const Show *sh) 
 }
 static void print_edge(yui *db, Str *o, u64 id, const Show *sh) {
     Edge *e = &db->edges[id - 1];
-    /* ★線の両端の点は、もともと属性を出しません（線が主役の行なので） */
-    print_node(db, o, e->from, &NONE);
+    print_node(db, o, e->from, node_show(sh));
     print_edge_step(o, e, 1, sh);
-    print_node(db, o, e->to, &NONE);
+    print_node(db, o, e->to, node_show(sh));
 }
 
 static void emit(yui *db, int kind, const char *text) {
@@ -1883,13 +1894,13 @@ static void print_path(yui *db, Str *o, u64 start, u64 last_node, u64 edge, u64 
         vec_push(&edges, db->nodes[cur - 1].via_edge);
         cur = db->nodes[cur - 1].via_node;
     }
-    print_node(db, o, start, &NONE);
+    print_node(db, o, start, node_show(sh));
     cur = start;
     for (i = nodes.n; i > 0; i--) {
         Edge *e = &db->edges[edges.v[i - 1] - 1];
         u64 nx = nodes.v[i - 1];
         print_edge_step(o, e, e->from == cur && e->to == nx, sh);
-        print_node(db, o, nx, &NONE);
+        print_node(db, o, nx, node_show(sh));
         cur = nx;
     }
     free(nodes.v);
