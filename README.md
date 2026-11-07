@@ -8,7 +8,7 @@ yui> 結ぶ (案件:結の開発)-[担当]->(人:田中)
 作りました
 
 yui> 辿る (人:田中)<-[担当]-(?案件)
-(案件:結の開発)-[担当]->(人:田中)
+(人:田中)<-[担当]-(案件:結の開発)
 1 件
 ```
 
@@ -50,6 +50,19 @@ build.bat
 make
 ```
 
+### テスト
+
+```
+make test        Linux / macOS
+build.bat test   Windows
+make test-san    AddressSanitizer / UBSan つき
+make test-wasm   wasm（emscripten）
+```
+
+push のたびに GitHub Actions で **Linux（gcc / clang）・macOS・Windows・wasm** の
+全部を回し、**土台をまたいでファイルがバイトまで同じか**も突き合わせています。
+書き方と、まだ見ていないものは [tests/README.md](tests/README.md) にあります。
+
 ### 組み込むとき
 
 `yui.c` と `yui.h`（Windows なら `yui_win.h` も）を自分のプロジェクトに入れて、一緒にコンパイルするだけです。`yui_cli.c` は CLI 用なので要りません。
@@ -77,6 +90,10 @@ yui 知識.yui "探す 田中"    1 回だけ実行する
 ```
 yui 知識.yui < 命令.txt
 ```
+
+★**Windows では、問い合わせを引数で渡すと日本語が通りません**（`問い合わせが
+UTF-8 として正しくありません` になります）。コマンドラインの引数が cp932 で
+渡ってくるためです。**ファイルか標準入力から流してください。**
 
 ## 言葉
 
@@ -162,8 +179,9 @@ yui 知識.yui < 命令.txt
 
 ## これから
 
-- **テストがまだありません**（`make test` は正直に失敗します）
-- macOS・iOS・Android でのビルド確認
+- CLI（終了コード・引数での 1 回実行）のテスト
+- Windows で、問い合わせの引数を UTF-8 で受け取る（[使い方](#使い方)の★）
+- iOS・Android でのビルド確認
 - 追記で太ったファイルの詰め直し
 - 外から使う口（ローカルの小さなサーバーか MCP）
 

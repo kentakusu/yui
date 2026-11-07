@@ -1,0 +1,161 @@
+# 結（yui）のテストを、push のたびに全部の土台で回します。
+# public リポジトリなので、標準のランナーは無料です。
+#
+# ★土台ごとに違う挙動を捕まえるのが目的です。
+#   実際にこれまで出たのは「Windows で UTF-8 のパスが開けない」と
+#   「wasm では排他が効かない」でした。手元 1 台では出ません。
+name: テスト
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# 同じ枝に push が続いたら、古い回は止めます
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    name: Linux（${{ matrix.cc }}）
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [gcc, clang]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 作る
+        run: make CC=${{ matrix.cc }}
+
+      - name: テスト
+        run: make test CC=${{ matrix.cc }}
+
+      - name: テスト（AddressSanitizer / UBSan つき）
+        run: make test-san CC=${{ matrix.cc }}
+
+      - name: 土台をまたぐ比較用のファイルを作る
+        if: matrix.cc == 'gcc'
+        run: ./yui compat.yui < tests/compat.txt
+
+      - uses: actions/upload-artifact@v4
+        if: matrix.cc == 'gcc'
+        with:
+          name: yui-linux
+          path: compat.yui
+          if-no-files-found: error
+
+  macos:
+    name: macOS
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 作る
+        run: make
+
+      - name: テスト
+        run: make test
+
+      - name: テスト（AddressSanitizer / UBSan つき）
+        run: make test-san
+
+  windows:
+    name: Windows（MSVC）
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: cmd
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 作る
+        run: .\build.bat
+
+      - name: テスト
+        run: .\build.bat test
+
+      - name: 土台をまたぐ比較用のファイルを作る
+        run: type tests\compat.txt | .\yui.exe compat.yui
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: yui-windows
+          path: compat.yui
+          if-no-files-found: error
+
+  wasm:
+    name: wasm（emscripten）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: emsdk を入れる
+        run: |
+          git clone --depth 1 https://github.com/emscripten-core/emsdk.git "$HOME/emsdk"
+          cd "$HOME/emsdk"
+          ./emsdk install latest
+          ./emsdk activate latest
+
+      - name: テスト
+        run: |
+          source "$HOME/emsdk/emsdk_env.sh"
+          make test-wasm
+
+  compat:
+    name: 土台をまたいでバイトまで同じか
+    needs: [linux, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: yui-linux
+          path: from-linux
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: yui-windows
+          path: from-windows
+
+      - name: 大きさと md5 を出す
+        run: |
+          ls -l from-linux/compat.yui from-windows/compat.yui
+          md5sum from-linux/compat.yui from-windows/compat.yui
+
+      - name: バイトを突き合わせる
+        run: cmp from-linux/compat.yui from-windows/compat.yui
+
+      # 日本語のファイル名も一緒に確かめます（README の例が 知識.yui なので）
+      - name: Windows で書いたファイルを Linux の実装で読む
+        run: |
+          make
+          cp from-windows/compat.yui 知識.yui
+          ./yui 知識.yui < tests/read.txt
+
+  compat-windows:
+    name: Linux で書いたファイルを Windows の実装で読む
+    needs: linux
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: cmd
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: yui-linux
+          path: from-linux
+
+      - name: 作る
+        run: .\build.bat
+
+      - name: 読む
+        run: type tests\read.txt | .\yui.exe from-linux\compat.yui
