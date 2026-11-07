@@ -229,6 +229,25 @@ typedef struct {
     Value v;
 } Attr;
 
+/*
+ * 結果に属性をどう出すか。文の末尾の修飾（parse_mods）が決めます。
+ *
+ *   既定         all=1              全部 出す
+ *   名前だけ     all=0, nkeys=0     1 つも出さない
+ *   見せる a,b   all=0, keys={a,b}  並べた順にその属性だけ出す
+ *
+ * ★keys は文ごとの置き場（db->stmt）に取るので、解放しません。
+ */
+#define MAX_SHOW 16 /* 見せる に並べられる属性の数 */
+typedef struct {
+    int all;
+    char **keys;
+    size_t nkeys;
+} Show;
+static const Show SHOW_ALL = {1, NULL, 0};
+/* 属性を 1 つも出さない指示。線の行の両端の点などに使う */
+static const Show NONE = {0, NULL, 0};
+
 typedef struct {
     char *label, *name;
     Attr *attrs;
@@ -1055,13 +1074,34 @@ static void print_attrs(Str *o, const Attr *a, size_t n) {
     }
     str_chr(o, '}');
 }
-static void print_node(yui *db, Str *o, u64 id, int with_attrs) {
+/* Show の指示どおりに属性を出す。見せる のときは書かれた順に並べる */
+static void print_attrs_sel(Str *o, const Attr *a, size_t n, const Show *sh) {
+    size_t i, j, out = 0;
+    if (sh->all) {
+        print_attrs(o, a, n);
+        return;
+    }
+    if (!sh->nkeys) return;
+    /* ★無い属性は黙って飛ばします。点ごとに持っている属性が違うのが普通なので、
+     *   「この点には 話者 が無い」をいちいちエラーにすると使えません。 */
+    for (i = 0; i < sh->nkeys; i++)
+        for (j = 0; j < n; j++)
+            if (strcmp(a[j].key, sh->keys[i]) == 0) {
+                str_add(o, out++ ? ", " : " {");
+                print_word(o, a[j].key);
+                str_add(o, ": ");
+                print_value(o, &a[j].v);
+                break;
+            }
+    if (out) str_chr(o, '}');
+}
+static void print_node(yui *db, Str *o, u64 id, const Show *sh) {
     Node *x = &db->nodes[id - 1];
     str_chr(o, '(');
     print_word(o, x->label);
     str_chr(o, ':');
     print_word(o, x->name);
-    if (with_attrs) print_attrs(o, x->attrs, x->nattrs);
+    print_attrs_sel(o, x->attrs, x->nattrs, sh);
     str_chr(o, ')');
 }
 /* 種類の字句。「3段」のような語は段数と読まれるので引用符で囲む */
@@ -1071,17 +1111,18 @@ static void print_type(Str *o, const char *t) {
     if (parse_depth(t, &d)) print_quoted(o, t);
     else print_word(o, t);
 }
-static void print_edge_step(Str *o, const Edge *e, int forward, int with_attrs) {
+static void print_edge_step(Str *o, const Edge *e, int forward, const Show *sh) {
     str_add(o, forward ? "-[" : "<-[");
     print_type(o, e->type);
-    if (with_attrs) print_attrs(o, e->attrs, e->nattrs);
+    print_attrs_sel(o, e->attrs, e->nattrs, sh);
     str_add(o, forward ? "]->" : "]-");
 }
-static void print_edge(yui *db, Str *o, u64 id, int with_attrs) {
+static void print_edge(yui *db, Str *o, u64 id, const Show *sh) {
     Edge *e = &db->edges[id - 1];
-    print_node(db, o, e->from, 0);
-    print_edge_step(o, e, 1, with_attrs);
-    print_node(db, o, e->to, 0);
+    /* ★線の両端の点は、もともと属性を出しません（線が主役の行なので） */
+    print_node(db, o, e->from, &NONE);
+    print_edge_step(o, e, 1, sh);
+    print_node(db, o, e->to, &NONE);
 }
 
 static void emit(yui *db, int kind, const char *text) {
@@ -1349,10 +1390,12 @@ static int parse_depth(const char *w, long *out) {
 /*
  * 文の末尾の修飾を読む。いまは 2 つ。順序は問いません。
  *
- *   新しい 20   新しい順に 20 件だけ返す（*lim）
- *   名前だけ    属性を出さず、名前とラベルだけ返す（*bare）
+ *   新しい 20     新しい順に 20 件だけ返す（*lim）
+ *   名前だけ      属性を出さず、名前とラベルだけ返す
+ *   見せる a,b    その属性だけ、書いた順に出す
  *
- * 無ければ *lim=0（上限なし）・*bare=0（属性を出す）で 0 を返す。
+ * 無ければ *lim=0（上限なし）・*sh は全部 出す、で 0 を返す。
+ * ★名前だけ と 見せる は一緒に書けません（どちらも属性の出し方を決めるので）。
  *
  * ★「新しい」は時刻を見ません。点の id の大きい順です。
  *   結は追記しかせず、id は書いた順に振られるので、id が大きい＝後に書いた、が
@@ -1365,19 +1408,51 @@ static int parse_depth(const char *w, long *out) {
  * ★同じ修飾を 2 回 書いたらエラーにします。黙って後ろ勝ちにすると、打ち間違いが
  *   「効かなかった」の形で出て、原因を探すことになります。
  */
-static int parse_mods(P *p, long *lim, int *bare) {
+static int parse_mods(P *p, long *lim, Show *sh) {
     static const char ATARA[] = "新しい";
     static const char BARE[] = "名前だけ";
+    static const char MISERU[] = "見せる";
     char *w, b[32], *end;
     long v;
+    int saw_bare = 0, saw_sel = 0;
     *lim = 0;
-    *bare = 0;
+    *sh = SHOW_ALL;
     for (;;) {
         skip_ws(p);
         if (strncmp(p->p, BARE, strlen(BARE)) == 0) {
-            if (*bare) return perr(p, "「名前だけ」は 1 回だけ書けます");
+            if (saw_bare) return perr(p, "「名前だけ」は 1 回だけ書けます");
+            if (saw_sel) return perr(p, "「名前だけ」と「見せる」は一緒に書けません");
             p->p += strlen(BARE);
-            *bare = 1;
+            saw_bare = 1;
+            sh->all = 0;
+            continue;
+        }
+        if (strncmp(p->p, MISERU, strlen(MISERU)) == 0) {
+            /* ★上限を決めて素直に取ります。並べるのは「どれを開くか決める」ための
+             *   数個なので、伸ばす仕組みは要りません。超えたら理由を言って止めます。 */
+            char *tmp[MAX_SHOW];
+            size_t nk = 0;
+            if (saw_sel) return perr(p, "「見せる」は 1 回だけ書けます");
+            if (saw_bare) return perr(p, "「名前だけ」と「見せる」は一緒に書けません");
+            p->p += strlen(MISERU);
+            for (;;) {
+                w = parse_word(p);
+                if (!*w)
+                    return perr(p,
+                                "「見せる」のあとに属性の名前を書いてください"
+                                "（例: 見せる 日時,話者）");
+                if (nk == MAX_SHOW)
+                    return perr(p, "「見せる」に並べられるのは 16 個までです");
+                tmp[nk++] = w;
+                skip_ws(p);
+                if (peek(p) != ',') break;
+                p->p++;
+            }
+            sh->keys = arena_alloc(&p->db->stmt, nk * sizeof *sh->keys);
+            memcpy(sh->keys, tmp, nk * sizeof *sh->keys);
+            sh->nkeys = nk;
+            saw_sel = 1;
+            sh->all = 0;
             continue;
         }
         if (strncmp(p->p, ATARA, strlen(ATARA)) != 0) return 0;
@@ -1590,7 +1665,7 @@ static int find_one(yui *db, const NodePat *pt, u64 *id) {
         size_t i;
         for (i = 0; i < v.n && i < 5; i++) {
             if (i) str_add(&o, "、");
-            print_node(db, &o, v.v[i], 0);
+            print_node(db, &o, v.v[i], &NONE);
         }
         if (v.n > 5) str_add(&o, " ほか");
         set_err(db, "「%s」は %llu 件あり、どちらか分かりません: %s。ラベルを付けてください",
@@ -1626,7 +1701,7 @@ static int cmd_make(P *p) {
     Str o = {0};
     if (parse_node(p, &n, 1) != 0) return -1;
     if (ensure_node(db, &n, &id, &st) != 0) return -1;
-    print_node(db, &o, id, 1);
+    print_node(db, &o, id, &SHOW_ALL);
     emit_str(db, &o);
     free(o.p);
     emit(db, YUI_SUMMARY, status_word(st));
@@ -1661,18 +1736,18 @@ static int cmd_link(P *p) {
         ib = t;
     }
     if (put_edge(db, ia, ib, e.type, e.attrs.a, e.attrs.n, &ie, &st) != 0) return -1;
-    print_edge(db, &o, ie, 1);
+    print_edge(db, &o, ie, &SHOW_ALL);
     emit_str(db, &o);
     free(o.p);
     emit(db, YUI_SUMMARY, status_word(st));
     return 0;
 }
 
-/* with_attrs=0 なら属性を出さない（「名前だけ」。parse_mods を見よ） */
-static void emit_doc(yui *db, u64 doc, int with_attrs) {
+/* 属性の出し方は Show が決める（名前だけ・見せる。parse_mods を見よ） */
+static void emit_doc(yui *db, u64 doc, const Show *sh) {
     Str o = {0};
-    if (doc & 1) print_edge(db, &o, doc >> 1, with_attrs);
-    else print_node(db, &o, doc >> 1, with_attrs);
+    if (doc & 1) print_edge(db, &o, doc >> 1, sh);
+    else print_node(db, &o, doc >> 1, sh);
     emit_str(db, &o);
     free(o.p);
 }
@@ -1722,8 +1797,9 @@ static int cmd_search(P *p) {
     size_t n, i, count = 0;
     Vec hits = {0};
     NodePat f;
-    int has_filter = 0, bare;
+    int has_filter = 0;
     long lim;
+    Show sh;
     char hint[192];
     if (parse_text(p, &q, &quoted) != 0) return -1;
     if (!*q) return perr(p, "探す文字を書いてください（例: 探す \"既読\"）");
@@ -1731,7 +1807,7 @@ static int cmd_search(P *p) {
         if (parse_node(p, &f, 0) != 0) return -1;
         has_filter = 1;
     }
-    if (parse_mods(p, &lim, &bare) != 0) return -1;
+    if (parse_mods(p, &lim, &sh) != 0) return -1;
     /* ★絞らない 探す は点と線の両方を返します。点の id と線の id は別の数直線なので、
      *   混ざったものを「新しい順」に並べられません（点を 10 個 作ったあとの線 1 本は、
      *   線の id が 1 なので、どう並べても点より古い側に来ます）。
@@ -1776,7 +1852,7 @@ static int cmd_search(P *p) {
             if (doc & 1) continue;
             if (!node_matches(&db->nodes[(doc >> 1) - 1], &f)) continue;
         }
-        emit_doc(db, doc, !bare);
+        emit_doc(db, doc, &sh);
         count++;
         if (lim && count == (size_t)lim) break;
     }
@@ -1796,7 +1872,7 @@ static int cmd_search(P *p) {
 
 /* 起点から終点までの道を、たどった順に書く */
 static void print_path(yui *db, Str *o, u64 start, u64 last_node, u64 edge, u64 next,
-                       int with_attrs) {
+                       const Show *sh) {
     Vec nodes = {0}, edges = {0};
     u64 cur = last_node;
     size_t i;
@@ -1807,13 +1883,13 @@ static void print_path(yui *db, Str *o, u64 start, u64 last_node, u64 edge, u64 
         vec_push(&edges, db->nodes[cur - 1].via_edge);
         cur = db->nodes[cur - 1].via_node;
     }
-    print_node(db, o, start, 0);
+    print_node(db, o, start, &NONE);
     cur = start;
     for (i = nodes.n; i > 0; i--) {
         Edge *e = &db->edges[edges.v[i - 1] - 1];
         u64 nx = nodes.v[i - 1];
-        print_edge_step(o, e, e->from == cur && e->to == nx, with_attrs);
-        print_node(db, o, nx, 0);
+        print_edge_step(o, e, e->from == cur && e->to == nx, sh);
+        print_node(db, o, nx, &NONE);
         cur = nx;
     }
     free(nodes.v);
@@ -1879,11 +1955,11 @@ static int cmd_walk(P *p) {
     Top top;
     size_t s, count = 0;
     long maxd, lim;
-    int bare;
+    Show sh;
     if (parse_node(p, &a, 0) != 0) return -1;
     if (parse_edge(p, &e, 0, 1) != 0) return -1;
     if (parse_node(p, &b, 0) != 0) return -1;
-    if (parse_mods(p, &lim, &bare) != 0) return -1;
+    if (parse_mods(p, &lim, &sh) != 0) return -1;
     if (lim) top_init(&top, (size_t)lim);
     maxd = e.depth ? e.depth : 1;
     collect_nodes(db, &a, &starts);
@@ -1913,7 +1989,7 @@ static int cmd_walk(P *p) {
                     ed->mark = gen;
                     v = side == 0 ? ed->to : ed->from;
                     if (node_matches(&db->nodes[v - 1], &b)) {
-                        print_path(db, &o, st, u, eid, v, !bare);
+                        print_path(db, &o, st, u, eid, v, &sh);
                         if (lim) {
                             top_push(&top, v, o.p ? o.p : "");
                             str_clear(&o);
@@ -1956,22 +2032,22 @@ static int cmd_show(P *p) {
     collect_nodes(db, &n, &v);
     for (i = 0; i < v.n && !db->stopped; i++) {
         Node *x = &db->nodes[v.v[i] - 1];
-        print_node(db, &o, v.v[i], 1);
+        print_node(db, &o, v.v[i], &SHOW_ALL);
         emit_str(db, &o);
         for (j = 0; j < x->out.n; j++) {
             Edge *e = &db->edges[x->out.v[j] - 1];
             if (!e->live) continue;
             str_add(&o, "  ");
-            print_edge_step(&o, e, 1, 1);
-            print_node(db, &o, e->to, 0);
+            print_edge_step(&o, e, 1, &SHOW_ALL);
+            print_node(db, &o, e->to, &NONE);
             emit_str(db, &o);
         }
         for (j = 0; j < x->in.n; j++) {
             Edge *e = &db->edges[x->in.v[j] - 1];
             if (!e->live || e->from == e->to) continue;
             str_add(&o, "  ");
-            print_edge_step(&o, e, 0, 1);
-            print_node(db, &o, e->from, 0);
+            print_edge_step(&o, e, 0, &SHOW_ALL);
+            print_node(db, &o, e->from, &NONE);
             emit_str(db, &o);
         }
     }
@@ -1987,17 +2063,17 @@ static int cmd_list(P *p) {
     Vec v = {0};
     size_t i, count;
     long lim;
-    int bare;
+    Show sh;
     memset(&n, 0, sizeof n);
     if (peek(p) == '(' && parse_node(p, &n, 0) != 0) return -1;
-    if (parse_mods(p, &lim, &bare) != 0) return -1;
+    if (parse_mods(p, &lim, &sh) != 0) return -1;
     collect_nodes(db, &n, &v);
     /* ★collect_nodes は id の昇順で返します（最後に vec_sort_unique を通るため）。
      *   なので「新しい N 件」は、後ろから N 個 取るだけで出せます。
      *   並べ直しも、余分な置き場も要りません。 */
     count = (lim && (size_t)lim < v.n) ? (size_t)lim : v.n;
     for (i = 0; i < count && !db->stopped; i++)
-        emit_doc(db, DOC_NODE(lim ? v.v[v.n - 1 - i] : v.v[i]), !bare);
+        emit_doc(db, DOC_NODE(lim ? v.v[v.n - 1 - i] : v.v[i]), &sh);
     emit_count(db, count, "");
     free(v.v);
     return 0;
@@ -2114,6 +2190,7 @@ static const char *const HELP[] = {
     "一覧 (人:)                                        そのラベルの点すべて",
     "一覧 (人:) 新しい 20                              新しい順に 20 件（探す 辿る にも）",
     "一覧 (人:) 名前だけ                               属性を出さない（探す 辿る にも）",
+    "一覧 (人:) 見せる 役職,年齢                       その属性だけ出す（探す 辿る にも）",
     "消す (人:田中)                                    点とその線を消す",
     "消す (案件:結の開発)-[担当]->(人:田中)            線を消す",
     "詰め直す                                          取り消した記録をファイルから落とす",
