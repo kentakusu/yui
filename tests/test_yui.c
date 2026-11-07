@@ -579,6 +579,36 @@ static void direct_tests(void) {
     ok("作業用の .詰 を残さないこと", body == NULL, body ? "残っています" : NULL);
     free(body);
 
+    /* 8-2. 古い版が残した .断片 があったら、詰め直す のときに知らせる
+     *      ★今の実装は .断片 を作らないので、ここで手で置いて確かめます。
+     *        置かないとこの道は 1 度も通らず、「在る」だけで終わります。 */
+    clean();
+    if (yui_open(TMP, &db) == YUI_OK) {
+        yui_exec(db, "作る (人:田中)", NULL, NULL);
+        yui_close(db);
+        f = open_file(TMPFRAG, "wb");
+        if (f) {
+            fwrite("書きかけの末尾", 1, 21, f);
+            fclose(f);
+        }
+        if (yui_open(TMP, &db) == YUI_OK) {
+            memset(&g, 0, sizeof g);
+            yui_exec(db, "詰め直す", collect, &g);
+            ok("古い .断片 が残っていたら知らせること",
+               g.n == 2 && strstr(g.text[0], ".断片") != NULL,
+               g.n ? g.text[0] : "（何も出ません）");
+            rows_free(&g);
+        } else {
+            ok("下ごしらえ（.断片 を置いて開く）", 0, yui_errmsg(db));
+        }
+        yui_close(db);
+        body = read_file(TMPFRAG, &len);
+        ok("知らせるだけで、.断片 を消さないこと", body != NULL && len == 21, NULL);
+        free(body);
+    } else {
+        ok("下ごしらえ（.断片 の試し）", 0, yui_errmsg(db));
+    }
+
     /* 9. 作業用の .詰 が既にあったら、消さずに断る
      *    ★前の詰め直しが途中で終わった跡を、黙って上書きしないためです。 */
     clean();
