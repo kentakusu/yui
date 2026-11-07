@@ -500,7 +500,8 @@ static int doc_has(yui *db, u64 doc, const u32 *q, size_t qn) {
         return x->live && (text_has(x->name, q, qn) || attrs_have(x->attrs, x->nattrs, q, qn));
     }
 }
-/* use_index=0 は全件走査。テストでは両方の答えを突き合わせる */
+/* use_index=0 は全件走査。YUI_SELFCHECK を付けたビルドでは、
+ * 探すたびに索引の答えと全件走査の答えを突き合わせる（cmd_search を見よ） */
 static void search_docs(yui *db, const u32 *q, size_t qn, int use_index, Vec *out) {
     size_t i;
     if (qn >= 2 && use_index) {
@@ -1643,6 +1644,23 @@ static int cmd_search(P *p) {
     }
     n = fold_text(q, &c);
     search_docs(db, c, n, 1, &hits);
+#ifdef YUI_SELFCHECK
+    /* 索引の答えと全件走査の答えを突き合わせる。
+     * ★索引の取りこぼしは「結果が少ない」形で出るので、答えだけ見ても気づけません。
+     *   テストのビルドだけで走ります（Makefile / build.bat が -DYUI_SELFCHECK を付ける）。 */
+    {
+        Vec all = {0};
+        search_docs(db, c, n, 0, &all);
+        if (all.n != hits.n ||
+            (hits.n && memcmp(all.v, hits.v, hits.n * sizeof *hits.v) != 0)) {
+            fprintf(stderr,
+                    "自己検査に失敗: 索引 %llu 件 / 全件走査 %llu 件（探した文字: %s）\n",
+                    (unsigned long long)hits.n, (unsigned long long)all.n, q);
+            abort();
+        }
+        free(all.v);
+    }
+#endif
     free(c);
     for (i = 0; i < hits.n && !db->stopped; i++) {
         u64 doc = hits.v[i];

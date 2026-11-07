@@ -37,6 +37,7 @@
 #include <fcntl.h>
 #include <io.h>
 #include <stddef.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -55,10 +56,33 @@ typedef long long ssize_t;
  * open の代わり。_O_BINARY を必ず足します（上の★）。
  * mode（0644 など）は Windows には読み書きの区別しか無いので、
  * 書き込みビットが立っていれば読み書き可として渡します。
+ *
+ * ★パスは UTF-16 に直してから開きます。
+ *   Windows の narrow な _open はパスを ANSI（日本語環境では cp932）と
+ *   解釈するので、UTF-8 のまま渡すと失敗します。
+ *   実測（cp932 の PC）: _open("x.断片" の UTF-8) は fd=-1 errno=-1、
+ *   _wopen は成功。これが無いと「知識.yui」も「<パス>.断片」も開けず、
+ *   書きかけの末尾を切り捨てる救済が丸ごと動きません。
+ *
+ * ★UTF-8 として読めないパスは、昔どおり ANSI として開きます。
+ *   CLI の argv は Windows から cp932 で渡ってくるためです。
  */
 static int yui_win_open(const char *path, int flags, int mode) {
     int pmode = (mode & 0200) ? (_S_IREAD | _S_IWRITE) : _S_IREAD;
-    return _open(path, flags | _O_BINARY, pmode);
+    wchar_t *w;
+    int n, fd;
+    flags |= _O_BINARY;
+    n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, NULL, 0);
+    if (n <= 0) return _open(path, flags, pmode);
+    w = (wchar_t *)malloc((size_t)n * sizeof *w);
+    if (!w) return _open(path, flags, pmode);
+    if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, w, n) <= 0) {
+        free(w);
+        return _open(path, flags, pmode);
+    }
+    fd = _wopen(w, flags, pmode);
+    free(w);
+    return fd;
 }
 
 /* read の代わり。size_t を Windows の unsigned int 幅に収めます。 */
