@@ -1346,6 +1346,34 @@ static int parse_depth(const char *w, long *out) {
     return 1;
 }
 
+/*
+ * 文の末尾の「新しい 20」を読む。無ければ *out=0（上限なし）で 0 を返す。
+ *
+ * ★「新しい」は時刻を見ません。点の id の大きい順です。
+ *   結は追記しかせず、id は書いた順に振られるので、id が大きい＝後に書いた、が
+ *   常に成り立ちます。詰め直す で振り直しても、生きている点を順に書くので
+ *   順序は保たれます。だから時刻の属性が無いファイルでも使えます。
+ *   逆に「属性の 時刻 で並べたい」ときには使えません（別の言葉が要ります）。
+ * ★「新しい20」と続けて書いても読めます（parse_word が数字から先を 1 語にするため）。
+ */
+static int parse_limit(P *p, long *out) {
+    static const char ATARA[] = "新しい";
+    char *w, b[32], *end;
+    long v;
+    *out = 0;
+    skip_ws(p);
+    if (strncmp(p->p, ATARA, strlen(ATARA)) != 0) return 0;
+    p->p += strlen(ATARA);
+    w = parse_word(p);
+    if (!*w || !fold_number(w, b, sizeof b) || !(b[0] >= '0' && b[0] <= '9'))
+        return perr(p, "「新しい」のあとに件数を書いてください（例: 新しい 20）");
+    errno = 0;
+    v = strtol(b, &end, 10);
+    if (*end || errno || v < 1) return perr(p, "件数は 1 以上の数で書いてください（例: 新しい 20）");
+    *out = v;
+    return 0;
+}
+
 typedef struct {
     Attr *a;
     size_t n;
@@ -1674,6 +1702,7 @@ static int cmd_search(P *p) {
     Vec hits = {0};
     NodePat f;
     int has_filter = 0;
+    long lim;
     char hint[192];
     if (parse_text(p, &q, &quoted) != 0) return -1;
     if (!*q) return perr(p, "探す文字を書いてください（例: 探す \"既読\"）");
@@ -1681,6 +1710,16 @@ static int cmd_search(P *p) {
         if (parse_node(p, &f, 0) != 0) return -1;
         has_filter = 1;
     }
+    if (parse_limit(p, &lim) != 0) return -1;
+    /* ★絞らない 探す は点と線の両方を返します。点の id と線の id は別の数直線なので、
+     *   混ざったものを「新しい順」に並べられません（点を 10 個 作ったあとの線 1 本は、
+     *   線の id が 1 なので、どう並べても点より古い側に来ます）。
+     *   黙って怪しい順に並べるより、点の形を書いてもらうことにしました。 */
+    if (lim && !has_filter)
+        return perr(p,
+                    "「新しい N」を付けるときは点の形も書いてください"
+                    "（例: 探す \"見積\" (便:) 新しい 20）。絞らないと線も混ざり、新しい順に"
+                    "並べられません");
     n = fold_text(q, &c);
     search_docs(db, c, n, 1, &hits);
 #ifdef YUI_SELFCHECK
@@ -1702,7 +1741,10 @@ static int cmd_search(P *p) {
 #endif
     free(c);
     for (i = 0; i < hits.n && !db->stopped; i++) {
-        u64 doc = hits.v[i];
+        /* ★hits は doc の昇順（search_docs の最後に vec_sort_unique を通る）。
+         *   「新しい N 件」のときは後ろから見ます。ここに来るのは点だけなので、
+         *   doc の降順＝点の id の降順＝新しい順です。 */
+        u64 doc = hits.v[lim ? hits.n - 1 - i : i];
         if (has_filter) {
             /* ★点の形を書いたら、返すのは点だけです。
              *   古い版は線も残していました（線の端の点が絞りに当たれば通す作り）。
@@ -1715,6 +1757,7 @@ static int cmd_search(P *p) {
         }
         emit_doc(db, doc);
         count++;
+        if (lim && count == (size_t)lim) break;
     }
     free(hits.v);
     /* ★0 件のときだけ、探した文字がラベルに当たらないか見ます。
@@ -1755,17 +1798,70 @@ static void print_path(yui *db, Str *o, u64 start, u64 last_node, u64 edge, u64 
     free(edges.v);
 }
 
+/*
+ * 「新しい N 件」のための受け皿。key（辿り着いた点の id）の大きい順に N 件だけ残す。
+ *
+ * ★辿る は歩きながら出す作りなので、全部 溜めてから並べ直すと、
+ *   当たりが数万件あるときに置き場がその分 要ります。ここは N 件だけ持ちます。
+ * ★道の文字列はその場で作って持ちます。辿る は歩きながら via_edge / via_node を
+ *   上書きしていくので、あとから道を作り直せません（print_path を見よ）。
+ * ★歩くのは全部 歩きます。N は「返す数」で、「見る数」ではありません。
+ *   先に打ち切ると、あとで見つかるはずの新しい点を落とします。
+ */
+typedef struct {
+    u64 key;
+    char *s;
+} TopItem;
+typedef struct {
+    TopItem *v;
+    size_t n, cap, alloc;
+} Top;
+
+static void top_init(Top *t, size_t cap) {
+    t->v = NULL;
+    t->n = 0;
+    t->cap = cap;
+    t->alloc = 0;
+}
+static void top_push(Top *t, u64 key, const char *s) {
+    size_t i;
+    if (t->n == t->cap) {
+        if (key <= t->v[t->cap - 1].key) return; /* いま持っている最小より古い */
+        free(t->v[t->cap - 1].s);                /* いちばん古いものを捨てる */
+    } else {
+        /* ★人が書いた N をそのまま確保しません。「新しい 1000000000」のような数でも、
+         *   当たりが 3 件なら 3 件ぶんしか取りません。要るぶんだけ伸ばします。 */
+        if (t->n == t->alloc) {
+            t->alloc = t->alloc ? t->alloc * 2 : 16;
+            if (t->alloc > t->cap) t->alloc = t->cap;
+            t->v = xrealloc(t->v, t->alloc * sizeof *t->v);
+        }
+        t->n++;
+    }
+    for (i = t->n - 1; i > 0 && t->v[i - 1].key < key; i--) t->v[i] = t->v[i - 1];
+    t->v[i].key = key;
+    t->v[i].s = xstrdup(s);
+}
+static void top_free(Top *t) {
+    size_t i;
+    for (i = 0; i < t->n; i++) free(t->v[i].s);
+    free(t->v);
+}
+
 static int cmd_walk(P *p) {
     yui *db = p->db;
     NodePat a, b;
     EdgePat e;
     Vec starts = {0}, queue = {0};
     Str o = {0};
+    Top top;
     size_t s, count = 0;
-    long maxd;
+    long maxd, lim;
     if (parse_node(p, &a, 0) != 0) return -1;
     if (parse_edge(p, &e, 0, 1) != 0) return -1;
     if (parse_node(p, &b, 0) != 0) return -1;
+    if (parse_limit(p, &lim) != 0) return -1;
+    if (lim) top_init(&top, (size_t)lim);
     maxd = e.depth ? e.depth : 1;
     collect_nodes(db, &a, &starts);
     for (s = 0; s < starts.n && !db->stopped; s++) {
@@ -1795,8 +1891,13 @@ static int cmd_walk(P *p) {
                     v = side == 0 ? ed->to : ed->from;
                     if (node_matches(&db->nodes[v - 1], &b)) {
                         print_path(db, &o, st, u, eid, v);
-                        emit_str(db, &o);
-                        count++;
+                        if (lim) {
+                            top_push(&top, v, o.p ? o.p : "");
+                            str_clear(&o);
+                        } else {
+                            emit_str(db, &o);
+                            count++;
+                        }
                     }
                     if (db->nodes[v - 1].mark != gen) {
                         Node *nv = &db->nodes[v - 1];
@@ -1809,6 +1910,11 @@ static int cmd_walk(P *p) {
                 }
             }
         }
+    }
+    if (lim) {
+        for (s = 0; s < top.n && !db->stopped; s++) emit(db, YUI_ROW, top.v[s].s);
+        count = top.n;
+        top_free(&top);
     }
     free(starts.v);
     free(queue.v);
@@ -1856,12 +1962,19 @@ static int cmd_list(P *p) {
     yui *db = p->db;
     NodePat n;
     Vec v = {0};
-    size_t i;
+    size_t i, count;
+    long lim;
     memset(&n, 0, sizeof n);
     if (peek(p) == '(' && parse_node(p, &n, 0) != 0) return -1;
+    if (parse_limit(p, &lim) != 0) return -1;
     collect_nodes(db, &n, &v);
-    for (i = 0; i < v.n && !db->stopped; i++) emit_doc(db, DOC_NODE(v.v[i]));
-    emit_count(db, v.n, "");
+    /* ★collect_nodes は id の昇順で返します（最後に vec_sort_unique を通るため）。
+     *   なので「新しい N 件」は、後ろから N 個 取るだけで出せます。
+     *   並べ直しも、余分な置き場も要りません。 */
+    count = (lim && (size_t)lim < v.n) ? (size_t)lim : v.n;
+    for (i = 0; i < count && !db->stopped; i++)
+        emit_doc(db, DOC_NODE(lim ? v.v[v.n - 1 - i] : v.v[i]));
+    emit_count(db, count, "");
     free(v.v);
     return 0;
 }
@@ -1975,6 +2088,7 @@ static const char *const HELP[] = {
     "辿る (私)-[]->()                                  種類も相手も問わない",
     "見る (人:田中)                                    属性とつながり",
     "一覧 (人:)                                        そのラベルの点すべて",
+    "一覧 (人:) 新しい 20                              新しい順に 20 件（探す 辿る にも）",
     "消す (人:田中)                                    点とその線を消す",
     "消す (案件:結の開発)-[担当]->(人:田中)            線を消す",
     "詰め直す                                          取り消した記録をファイルから落とす",
