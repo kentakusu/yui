@@ -2,8 +2,9 @@
 # public リポジトリなので、標準のランナーは無料です。
 #
 # ★土台ごとに違う挙動を捕まえるのが目的です。
-#   実際にこれまで出たのは「Windows で UTF-8 のパスが開けない」と
-#   「wasm では排他が効かない」でした。手元 1 台では出ません。
+#   実際にこれまで出たのは「Windows で UTF-8 のパスが開けない」
+#   「Windows の argv は cp932 で来る」「wasm では排他が効かない」でした。
+#   手元 1 台では出ません。
 name: テスト
 
 on:
@@ -79,6 +80,21 @@ jobs:
 
       - name: テスト
         run: .\build.bat test
+
+      # ★ここだけ pwsh です。cmd はバッチファイルをその時のコードページで
+      #   読むので、日本語を引数に書くには chcp が要ります。pwsh は UTF-8 で
+      #   読み、引数も UTF-16 のまま渡すので、測りたいもの（本体が引数を
+      #   UTF-8 で受け取れるか）だけを測れます。
+      - name: 日本語を引数で渡せること（★cp932 の罠）
+        shell: pwsh
+        run: |
+          [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+          .\yui.exe argv.yui "作る (人:田中)"
+          if ($LASTEXITCODE -ne 0) { throw "作る が失敗しました（rc=$LASTEXITCODE）" }
+          $out = .\yui.exe argv.yui "探す 田中" | Out-String
+          if ($LASTEXITCODE -ne 0) { throw "探す が失敗しました（rc=$LASTEXITCODE）" }
+          Write-Host $out
+          if ($out -notmatch "人:田中") { throw "引数で渡した日本語が通っていません" }
 
       - name: 土台をまたぐ比較用のファイルを作る
         run: type tests\compat.txt | .\yui.exe compat.yui

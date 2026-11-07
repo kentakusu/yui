@@ -22,7 +22,8 @@
 #ifdef _WIN32
 /*
  * ★Windows の narrow な fopen / remove も、パスを ANSI（cp932）と解釈します。
- *   テストが直に触る「<パス>.断片」は UTF-8 なので、ここだけ UTF-16 に直します。
+ *   テストが見る「<パス>.断片」は UTF-8 なので、ここだけ UTF-16 に直します
+ *   （今の実装は作りません。作っていないことを確かめるために名前を持っています）。
  *   本体の側は yui_win.h が同じことをしています。
  *   ここで setlocale(".UTF8") に逃げると、本体の不具合も一緒に隠れてしまうので
  *   使いません（テストが効かなくなります）。
@@ -442,7 +443,9 @@ static void direct_tests(void) {
     }
     yui_close(db);
 
-    /* 3. 書きかけの末尾は切り捨てて知らせる。捨てた分は .断片 に残る */
+    /* 3. 書きかけの末尾は切り捨てて知らせる。捨てた分は残さない
+     *    ★以前は <パス>.断片 へ退避していました。消したはずの本文が隣に残るので、
+     *      作らないことにしました（yui.c の replay の★）。 */
     make_small();
     f = open_file(TMP, "ab");
     if (f) {
@@ -450,7 +453,9 @@ static void direct_tests(void) {
         fclose(f);
     }
     if (yui_open(TMP, &db) == YUI_OK) {
-        ok("書きかけの末尾を切り捨てたら知らせること", yui_notice(db) != NULL, NULL);
+        ok("書きかけの末尾を切り捨てたら知らせること",
+           yui_notice(db) != NULL && strstr(yui_notice(db), "捨てました") != NULL,
+           yui_notice(db) ? yui_notice(db) : "（お知らせがありません）");
         memset(&g, 0, sizeof g);
         yui_exec(db, "一覧 ()", collect, &g);
         ok("切り捨てても、その前の記録は読めること", g.n == 3, NULL); /* 点 2 つ + 締め */
@@ -460,7 +465,7 @@ static void direct_tests(void) {
     }
     yui_close(db);
     body = read_file(TMPFRAG, &len);
-    ok("切り捨てた分が .断片 に残ること", body != NULL && len == 5, NULL);
+    ok(".断片 を作らないこと", body == NULL, body ? "できてしまいました" : NULL);
     free(body);
 
     /* 4. 途中が壊れていたら開かない
@@ -513,7 +518,8 @@ static void direct_tests(void) {
 
     /* まだ見ていないもの。黙っていると「見た」と読まれるので、毎回 出します */
     skip("CLI（yui_cli.c）の振る舞い",
-         "終了コード・1 回実行・標準入力の読み方は、まだ通していません");
+         "終了コード・標準入力の読み方は、まだ通していません"
+         "。引数での 1 回実行は CI の Windows だけで見ています");
 
     clean();
 }

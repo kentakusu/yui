@@ -60,12 +60,13 @@ typedef long long ssize_t;
  * ★パスは UTF-16 に直してから開きます。
  *   Windows の narrow な _open はパスを ANSI（日本語環境では cp932）と
  *   解釈するので、UTF-8 のまま渡すと失敗します。
- *   実測（cp932 の PC）: _open("x.断片" の UTF-8) は fd=-1 errno=-1、
- *   _wopen は成功。これが無いと「知識.yui」も「<パス>.断片」も開けず、
- *   書きかけの末尾を切り捨てる救済が丸ごと動きません。
+ *   実測（cp932 の PC・測ったパスは「x.断片」）: UTF-8 のまま _open すると
+ *   fd=-1 errno=-1、_wopen は成功。日本語を含むパスはこれが無いと開けません
+ *   （「知識.yui」も同じです）。
  *
  * ★UTF-8 として読めないパスは、昔どおり ANSI として開きます。
- *   CLI の argv は Windows から cp932 で渡ってくるためです。
+ *   CLI は argv を UTF-8 に直してから渡しますが（yui_cli.c の★）、
+ *   ライブラリとして組み込む側が ANSI のパスを渡すことはあるためです。
  */
 static int yui_win_open(const char *path, int flags, int mode) {
     int pmode = (mode & 0200) ? (_S_IREAD | _S_IWRITE) : _S_IREAD;

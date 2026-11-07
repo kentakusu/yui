@@ -1979,21 +1979,6 @@ int yui_exec(yui *db, const char *query, yui_cb cb, void *ctx) {
 
 /* ------------------------------------------------------------------ 開く */
 
-/* 切り捨てる部分は捨てずに <パス>.断片 へ足しておく */
-static int save_fragment(yui *db, const u8 *d, size_t n) {
-    Str path = {0};
-    int fd, rc = -1;
-    str_add(&path, db->path);
-    str_add(&path, ".断片");
-    fd = open(path.p, O_WRONLY | O_CREAT | O_APPEND, 0644);
-    if (fd >= 0) {
-        rc = write_all(fd, d, n);
-        close(fd);
-    }
-    free(path.p);
-    return rc;
-}
-
 static int replay(yui *db, u8 *d, size_t size) {
     size_t pos = MAGIC_LEN, torn = 0;
     int has_torn = 0;
@@ -2052,15 +2037,18 @@ static int replay(yui *db, u8 *d, size_t size) {
     if (has_torn) {
         size_t cut = size - torn;
         char b[256];
-        if (save_fragment(db, d + torn, cut) != 0) {
-            set_err(db, "書きかけの末尾を退避できないので開けません: %s", strerror(errno));
-            return -1;
-        }
+        /* ★捨てます。<パス>.断片 のような別ファイルには残しません。
+         *   残すと「消したはずの本文が隣のファイルに居る」ことになり、
+         *   詰め直す で取り消した記録を落としても、そちらに残ります。
+         *   捨てるのは「crc の合わない最後の記録から末尾まで」で、書き終わった
+         *   記録（crc の合う記録）は入りません（追記しかしないため）。
+         *   ただし落ちた拍子に途中が飛んでいれば、その先も一緒に捨てます。 */
         if (ftruncate(db->fd, (off_t)torn) != 0) {
             set_err(db, "書きかけの末尾を切り捨てられません: %s", strerror(errno));
             return -1;
         }
-        snprintf(b, sizeof b, "書きかけの末尾 %llu バイトを切り捨てました（.断片 に退避）",
+        snprintf(b, sizeof b,
+                 "書きかけの末尾 %llu バイトを捨てました（最後の書き込みが途中で終わっています）",
                  (unsigned long long)cut);
         db->notice = xstrdup(b);
         size = torn;
