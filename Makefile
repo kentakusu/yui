@@ -68,6 +68,6 @@ record: build/yui_test
 	done
 
 clean:
-	rm -rf build yui yui_test_tmp.yui yui_test_tmp.yui.断片
+	rm -rf build yui yui_test_tmp.yui yui_test_tmp.yui.断片 yui_test_tmp.yui.詰
 
 .PHONY: all san test test-san test-wasm record clean

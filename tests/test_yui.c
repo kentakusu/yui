@@ -39,6 +39,7 @@
 
 #define TMP     "yui_test_tmp.yui"
 #define TMPFRAG "yui_test_tmp.yui.断片"
+#define TMPPACK "yui_test_tmp.yui.詰" /* 詰め直す の作業用。残っていたら失敗 */
 #define MAXROW  256
 
 static int ng = 0;      /* 失敗した数 */
@@ -146,6 +147,17 @@ static char *read_file(const char *path, long *len) {
 static void clean(void) {
     remove_file(TMP);
     remove_file(TMPFRAG);
+    remove_file(TMPPACK);
+}
+
+/* NUL を含むファイルの中を探す。strstr は最初の NUL で止まるので使えません */
+static int has_bytes(const char *hay, long n, const char *needle) {
+    size_t m = strlen(needle);
+    long i;
+    if (!hay || m == 0 || n < (long)m) return 0;
+    for (i = 0; i + (long)m <= n; i++)
+        if (memcmp(hay + i, needle, m) == 0) return 1;
+    return 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -516,7 +528,84 @@ static void direct_tests(void) {
     /* 7. NULL を閉じても落ちない */
     ok("yui_close(NULL) が落ちないこと", yui_close(NULL) == YUI_OK, NULL);
 
+    /* 8. 詰め直すと、取り消した本文がファイルから無くなる
+     *    ★先に「消しただけでは残っている」ことを見ます（陽性対照）。
+     *      これが無いと、探し方が悪くて見つからないのと区別が付きません。 */
+    clean();
+    if (yui_open(TMP, &db) == YUI_OK) {
+        yui_exec(db, "作る (メモ:あとで消す {本文: \"ここだけの話\"})", NULL, NULL);
+        yui_exec(db, "作る (人:残る人)", NULL, NULL);
+        yui_exec(db, "結ぶ (案件:結)-[担当]->(人:残る人)", NULL, NULL);
+        yui_exec(db, "消す (メモ:あとで消す)", NULL, NULL);
+    } else {
+        ok("下ごしらえ（詰め直す 用のファイルを作る）", 0, yui_errmsg(db));
+    }
+    yui_close(db);
+    body = read_file(TMP, &len);
+    ok("消しただけでは本文がファイルに残ること（陽性対照）",
+       has_bytes(body, len, "ここだけの話"), "残っていません");
+    free(body);
+    if (yui_open(TMP, &db) == YUI_OK) {
+        memset(&g, 0, sizeof g);
+        yui_exec(db, "詰め直す", collect, &g);
+        ok("詰め直したら知らせること",
+           g.n == 1 && strstr(g.text[0], "詰め直しました") != NULL,
+           g.n ? g.text[0] : "（何も出ません）");
+        rows_free(&g);
+        memset(&g, 0, sizeof g);
+        yui_exec(db, "一覧 ()", collect, &g);
+        ok("詰め直したあとも、残る点が読めること", g.n == 3, NULL); /* 点 2 つ + 締め */
+        rows_free(&g);
+        memset(&g, 0, sizeof g);
+        yui_exec(db, "辿る (案件:結)-[担当]->(?誰か)", collect, &g);
+        ok("詰め直したあとも、線が辿れること（id を振り直すので）", g.n == 2,
+           g.n ? g.text[0] : "（何も出ません）");
+        rows_free(&g);
+        memset(&g, 0, sizeof g);
+        yui_exec(db, "作る (人:あとから足す人)", collect, &g);
+        ok("詰め直したあとに書き足せること", g.n == 2, g.n ? g.text[0] : "（何も出ません）");
+        rows_free(&g);
+    } else {
+        ok("詰め直す ために開けること", 0, yui_errmsg(db));
+    }
+    yui_close(db);
+    body = read_file(TMP, &len);
+    ok("詰め直すと取り消した本文が消えること", !has_bytes(body, len, "ここだけの話"),
+       "まだ残っています");
+    ok("詰め直しても残る点の本文は在ること", has_bytes(body, len, "残る人"), NULL);
+    ok("詰め直したあとに書き足した分も在ること", has_bytes(body, len, "あとから足す人"), NULL);
+    free(body);
+    body = read_file(TMPPACK, &len);
+    ok("作業用の .詰 を残さないこと", body == NULL, body ? "残っています" : NULL);
+    free(body);
+
+    /* 9. 作業用の .詰 が既にあったら、消さずに断る
+     *    ★前の詰め直しが途中で終わった跡を、黙って上書きしないためです。 */
+    clean();
+    if (yui_open(TMP, &db) == YUI_OK) {
+        yui_exec(db, "作る (人:田中)", NULL, NULL);
+        f = open_file(TMPPACK, "wb");
+        if (f) {
+            fwrite("人のもの", 1, 12, f);
+            fclose(f);
+        }
+        memset(&g, 0, sizeof g);
+        ok(".詰 が既にあったら断ること", yui_exec(db, "詰め直す", collect, &g) == YUI_ERROR,
+           NULL);
+        ok("断る理由に名前を出すこと", strstr(yui_errmsg(db), TMPPACK) != NULL, yui_errmsg(db));
+        rows_free(&g);
+    } else {
+        ok("下ごしらえ（.詰 を置く）", 0, yui_errmsg(db));
+    }
+    yui_close(db);
+    body = read_file(TMPPACK, &len);
+    ok("断ったとき、人が置いた .詰 を消さないこと", body != NULL && len == 12, NULL);
+    free(body);
+
     /* まだ見ていないもの。黙っていると「見た」と読まれるので、毎回 出します */
+    skip("詰め直す の失敗の道",
+         "書けない・読めない・入れ替えられないときの振る舞いは、まだ通していません"
+         "（.詰 が既にあるときだけ見ています）");
     skip("CLI（yui_cli.c）の振る舞い",
          "終了コード・標準入力の読み方は、まだ通していません"
          "。引数での 1 回実行は CI の Windows だけで見ています");

@@ -1886,6 +1886,37 @@ static int cmd_delete(P *p) {
     return 0;
 }
 
+/* 詰め直す の本体は「開く」の節にあります（開き直す道具と同じ場所なので） */
+static int repack(yui *db, u64 *nnode, u64 *nedge, u64 *before, u64 *after);
+static int file_exists(const char *path);
+
+static int cmd_repack(P *p) {
+    yui *db = p->db;
+    u64 nn = 0, ne = 0, before = 0, after = 0;
+    Str frag = {0};
+    char msg[256];
+    if (repack(db, &nn, &ne, &before, &after) != 0) return -1;
+    /* ★古い版は <パス>.断片 を作っていました。残っていると、詰め直しても
+     *   取り消した本文がそちらに居ます。消すかどうかは持ち主の判断なので、
+     *   こちらからは消さずに知らせます。 */
+    str_add(&frag, db->path);
+    str_add(&frag, ".断片");
+    if (file_exists(frag.p)) {
+        char w[512];
+        snprintf(w, sizeof w,
+                 "★%s が残っています（古い版が書きかけの末尾を退避したもの）。"
+                 "取り消した本文が入っていることがあるので、中を見てから消してください",
+                 frag.p);
+        emit(db, YUI_ROW, w);
+    }
+    free(frag.p);
+    snprintf(msg, sizeof msg, "詰め直しました: 点 %llu 件 / 線 %llu 本 / %llu → %llu バイト",
+             (unsigned long long)nn, (unsigned long long)ne, (unsigned long long)before,
+             (unsigned long long)after);
+    emit(db, YUI_SUMMARY, msg);
+    return 0;
+}
+
 static const char *const HELP[] = {
     "作る (人:田中 {役職: \"部長\", 年齢: 42})          点を作る。あれば属性を重ねる",
     "結ぶ (案件:結の開発)-[担当]->(人:田中)            線を引く。無い点は作る",
@@ -1898,6 +1929,7 @@ static const char *const HELP[] = {
     "一覧 (人:)                                        そのラベルの点すべて",
     "消す (人:田中)                                    点とその線を消す",
     "消す (案件:結の開発)-[担当]->(人:田中)            線を消す",
+    "詰め直す                                          取り消した記録をファイルから落とす",
     "同期                                              ファイルへ確実に書き出す",
     "終わる                                            終了",
     "点の書き方: (名前)  (ラベル:名前)  (ラベル:)  (?なんでも)  ()",
@@ -1928,6 +1960,7 @@ static int exec_stmt(P *p) {
     else if (strcmp(kw, "見る") == 0) rc = cmd_show(p);
     else if (strcmp(kw, "一覧") == 0) rc = cmd_list(p);
     else if (strcmp(kw, "消す") == 0) rc = cmd_delete(p);
+    else if (strcmp(kw, "詰め直す") == 0) rc = cmd_repack(p);
     else if (strcmp(kw, "同期") == 0) {
         if (fsync(db->fd) != 0) {
             set_err(db, "同期に失敗しました: %s", strerror(errno));
@@ -1978,6 +2011,42 @@ int yui_exec(yui *db, const char *query, yui_cb cb, void *ctx) {
 }
 
 /* ------------------------------------------------------------------ 開く */
+
+/* 点・線・索引・地図を解放して、開く前の空の状態へ戻します。
+ * 閉じるときと、詰め直して読み直すときの両方で通ります。 */
+static void free_state(yui *db) {
+    size_t i;
+    for (i = 0; i < db->nn; i++) {
+        Node *x = &db->nodes[i];
+        free(x->label);
+        free(x->name);
+        attrs_free(x->attrs, x->nattrs);
+        free(x->out.v);
+        free(x->in.v);
+    }
+    for (i = 0; i < db->ne; i++) {
+        free(db->edges[i].type);
+        attrs_free(db->edges[i].attrs, db->edges[i].nattrs);
+    }
+    free(db->nodes);
+    free(db->edges);
+    map_free(&db->m_key);
+    map_free(&db->m_name);
+    map_free(&db->m_label);
+    map_free(&db->m_edge);
+    for (i = 0; i < db->gramcap; i++) free(db->grams[i].list.v);
+    free(db->grams);
+    arena_reset(&db->stmt);
+    arena_reset(&db->scratch);
+    db->nodes = NULL;
+    db->nn = db->ncap = 0;
+    db->edges = NULL;
+    db->ne = db->ecap = 0;
+    db->grams = NULL;
+    db->ngrams = db->gramcap = 0;
+    db->gen = 0;
+    db->size = 0;
+}
 
 static int replay(yui *db, u8 *d, size_t size) {
     size_t pos = MAGIC_LEN, torn = 0;
@@ -2057,11 +2126,257 @@ static int replay(yui *db, u8 *d, size_t size) {
     return 0;
 }
 
-int yui_open(const char *path, yui **out) {
-    yui *db = xmalloc(sizeof *db);
+/* db->fd を頭から読んで、記録を順に適用します。
+ * 開くときと、詰め直して入れ替えたあとの読み直しで通ります。 */
+static int load_file(yui *db) {
     struct stat st;
     u8 *data;
     size_t got = 0;
+    if (lseek(db->fd, 0, SEEK_SET) < 0) {
+        set_err(db, "位置を動かせません: %s", strerror(errno));
+        return -1;
+    }
+    if (fstat(db->fd, &st) != 0) {
+        set_err(db, "大きさを読めません: %s", strerror(errno));
+        return -1;
+    }
+    if (st.st_size == 0) {
+        if (write_all(db->fd, MAGIC, MAGIC_LEN) != 0) {
+            set_err(db, "書けません: %s", strerror(errno));
+            return -1;
+        }
+        db->size = MAGIC_LEN;
+        return 0;
+    }
+    data = xmalloc((size_t)st.st_size);
+    while (got < (size_t)st.st_size) {
+        ssize_t r = read(db->fd, data + got, (size_t)st.st_size - got);
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) {
+            free(data);
+            set_err(db, "読めません: %s", r < 0 ? strerror(errno) : "途中で終わりました");
+            return -1;
+        }
+        got += (size_t)r;
+    }
+    if (replay(db, data, got) != 0) {
+        free(data);
+        return -1;
+    }
+    free(data);
+    if (lseek(db->fd, 0, SEEK_END) < 0) {
+        set_err(db, "位置を動かせません: %s", strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
+/* -------------------------------------------------------------- 詰め直す */
+
+/* 作業用のファイルの名前。詰め直しが終われば消えます */
+#define PACK_SUFFIX ".詰"
+
+static int file_exists(const char *path) {
+    int fd = open(path, O_RDONLY, 0);
+    if (fd < 0) return 0;
+    close(fd);
+    return 1;
+}
+
+/* 記録 1 件を、長さ・種別・CRC で包んで out へ足します（commit_record と同じ形） */
+static int pack_record(yui *db, Str *out, int kind, const Str *body) {
+    size_t blen = body->n, total = 5 + blen + 4;
+    u8 *buf;
+    if (blen >= MAX_BODY) {
+        set_err(db, "データが大きすぎます（1 件 1 GiB まで）");
+        return -1;
+    }
+    buf = xmalloc(total);
+    put32(buf, (u32)blen);
+    buf[4] = (u8)kind;
+    if (blen) memcpy(buf + 5, body->p, blen);
+    put32(buf + 5 + blen, crc_calc(db, buf, 5 + blen));
+    str_mem(out, buf, total);
+    free(buf);
+    return 0;
+}
+
+/*
+ * 生きている点と線だけを並べた、新しい中身を作ります。
+ * ★id は 1 から振り直します（消えた点の分が空くため）。
+ *   id はファイルの中だけの番号で、外へは出していません。
+ */
+static int build_packed(yui *db, Str *out, u64 *out_nn, u64 *out_ne) {
+    u64 *newid = NULL;
+    size_t i;
+    u64 nn = 0, ne = 0;
+    int rc = 0;
+    str_mem(out, MAGIC, MAGIC_LEN);
+    if (db->nn) newid = xmalloc(db->nn * sizeof *newid);
+    for (i = 0; i < db->nn; i++) {
+        Node *x = &db->nodes[i];
+        Str b = {0};
+        newid[i] = 0;
+        if (!x->live) continue;
+        newid[i] = ++nn;
+        enc_var(&b, newid[i]);
+        enc_str(&b, x->label);
+        enc_str(&b, x->name);
+        enc_attrs(&b, x->attrs, x->nattrs);
+        rc = pack_record(db, out, R_NODE, &b);
+        free(b.p);
+        if (rc != 0) goto done;
+    }
+    for (i = 0; i < db->ne; i++) {
+        Edge *e = &db->edges[i];
+        Str b = {0};
+        if (!e->live) continue;
+        /* 点を消すときに線も消しているので、ここは起きないはずです。
+         * 起きたら索引の作りが壊れているので、入れ替えずに止めます。 */
+        if (!newid[e->from - 1] || !newid[e->to - 1]) {
+            set_err(db, "内部エラー: 生きている線の端が消えています");
+            rc = -1;
+            goto done;
+        }
+        enc_var(&b, ++ne);
+        enc_var(&b, newid[e->from - 1]);
+        enc_var(&b, newid[e->to - 1]);
+        enc_str(&b, e->type);
+        enc_attrs(&b, e->attrs, e->nattrs);
+        rc = pack_record(db, out, R_EDGE, &b);
+        free(b.p);
+        if (rc != 0) goto done;
+    }
+done:
+    free(newid);
+    *out_nn = nn;
+    *out_ne = ne;
+    return rc;
+}
+
+/*
+ * 取り消した記録を、ファイルから本当に落とします。
+ * 追記しかしない作りなので、消した点の本文もファイルには残り続けます。
+ *
+ * 流れは「作業用のファイルへ書く → 開いて読めることを確かめる →
+ * 入れ替える → 開き直す」。
+ * ★確かめてから入れ替えます。逆にすると、壊れた中身で元を上書きします。
+ * ★途中で失敗したら、元のファイルはそのままです（作業用の方を消します）。
+ * ★入れ替えの直前に自分の fd を閉じます（Windows は開いたままでは入れ替え
+ *   られません）。閉じている間だけ錠が外れるので、ほかから開ける窓が
+ *   わずかに空きます。v0 では塞いでいません。
+ */
+static int repack(yui *db, u64 *nnode, u64 *nedge, u64 *before, u64 *after) {
+    Str img = {0}, tmp = {0};
+    yui *chk = NULL;
+    u64 cn = 0, ce = 0;
+    size_t i;
+    int fd;
+
+    *before = db->size;
+    if (build_packed(db, &img, nnode, nedge) != 0) goto fail;
+    str_add(&tmp, db->path);
+    str_add(&tmp, PACK_SUFFIX);
+
+    /* 1. 作業用のファイルへ書く。★既に在ったら、消さずに断ります */
+    fd = open(tmp.p, O_WRONLY | O_CREAT | O_EXCL, 0644);
+    if (fd < 0) {
+        if (errno == EEXIST)
+            set_err(db,
+                    "%s が既にあります。前の詰め直しが途中で終わったのかもしれません。"
+                    "中を見てから消してください",
+                    tmp.p);
+        else
+            set_err(db, "詰め直し用のファイルを作れません: %s: %s", tmp.p, strerror(errno));
+        goto fail;
+    }
+    if (write_all(fd, img.p, img.n) != 0) {
+        set_err(db, "詰め直し用のファイルに書けません: %s", strerror(errno));
+        close(fd);
+        goto fail_rm;
+    }
+    if (fsync(fd) != 0) {
+        set_err(db, "詰め直し用のファイルを同期できません: %s", strerror(errno));
+        close(fd);
+        goto fail_rm;
+    }
+    if (close(fd) != 0) {
+        set_err(db, "詰め直し用のファイルを閉じられません: %s", strerror(errno));
+        goto fail_rm;
+    }
+
+    /* 2. 入れ替える前に、書いたものが読めるか確かめる */
+    if (yui_open(tmp.p, &chk) != YUI_OK) {
+        set_err(db, "詰め直したものが読めないので、入れ替えません: %s", yui_errmsg(chk));
+        yui_close(chk);
+        goto fail_rm;
+    }
+    for (i = 0; i < chk->nn; i++)
+        if (chk->nodes[i].live) cn++;
+    for (i = 0; i < chk->ne; i++)
+        if (chk->edges[i].live) ce++;
+    yui_close(chk);
+    if (cn != *nnode || ce != *nedge) {
+        set_err(db,
+                "詰め直したものの数が合わないので、入れ替えません"
+                "（点 %llu のはずが %llu・線 %llu のはずが %llu）",
+                (unsigned long long)*nnode, (unsigned long long)cn, (unsigned long long)*nedge,
+                (unsigned long long)ce);
+        goto fail_rm;
+    }
+
+    /* 3. 入れ替える。ここで錠をいったん手放します */
+    if (fsync(db->fd) != 0) {
+        set_err(db, "元のファイルを同期できません: %s", strerror(errno));
+        goto fail_rm;
+    }
+    close(db->fd);
+    db->fd = -1;
+    if (rename(tmp.p, db->path) != 0) {
+        set_err(db, "入れ替えられません: %s: %s", db->path, strerror(errno));
+        /* 元のファイルはそのままなので、開き直して使えるようにします */
+        db->fd = open(db->path, O_RDWR, 0644);
+        if (db->fd >= 0) {
+            flock(db->fd, LOCK_EX | LOCK_NB);
+            lseek(db->fd, 0, SEEK_END);
+        }
+        goto fail_rm;
+    }
+
+    /* 4. 新しい中身で、索引ごと作り直す */
+    free_state(db);
+    db->fd = open(db->path, O_RDWR, 0644);
+    if (db->fd < 0) {
+        set_err(db, "詰め直したファイルを開き直せません（中身は入れ替わっています）: %s",
+                strerror(errno));
+        goto fail;
+    }
+    if (flock(db->fd, LOCK_EX | LOCK_NB) != 0) {
+        set_err(db, "詰め直したファイルが別のところで開かれています: %s", db->path);
+        close(db->fd);
+        db->fd = -1;
+        goto fail;
+    }
+    if (load_file(db) != 0) {
+        close(db->fd);
+        db->fd = -1;
+        goto fail;
+    }
+    *after = db->size;
+    free(img.p);
+    free(tmp.p);
+    return 0;
+
+fail_rm:
+    remove(tmp.p);
+fail:
+    free(img.p);
+    free(tmp.p);
+    return -1;
+}
+
+int yui_open(const char *path, yui **out) {
+    yui *db = xmalloc(sizeof *db);
     memset(db, 0, sizeof *db);
     db->fd = -1;
     *out = db;
@@ -2080,38 +2395,7 @@ int yui_open(const char *path, yui **out) {
         set_err(db, "別のところで開かれています: %s", path);
         goto fail;
     }
-    if (fstat(db->fd, &st) != 0) {
-        set_err(db, "大きさを読めません: %s", strerror(errno));
-        goto fail;
-    }
-    if (st.st_size == 0) {
-        if (write_all(db->fd, MAGIC, MAGIC_LEN) != 0) {
-            set_err(db, "書けません: %s", strerror(errno));
-            goto fail;
-        }
-        db->size = MAGIC_LEN;
-        return YUI_OK;
-    }
-    data = xmalloc((size_t)st.st_size);
-    while (got < (size_t)st.st_size) {
-        ssize_t r = read(db->fd, data + got, (size_t)st.st_size - got);
-        if (r < 0 && errno == EINTR) continue;
-        if (r <= 0) {
-            free(data);
-            set_err(db, "読めません: %s", r < 0 ? strerror(errno) : "途中で終わりました");
-            goto fail;
-        }
-        got += (size_t)r;
-    }
-    if (replay(db, data, got) != 0) {
-        free(data);
-        goto fail;
-    }
-    free(data);
-    if (lseek(db->fd, 0, SEEK_END) < 0) {
-        set_err(db, "位置を動かせません: %s", strerror(errno));
-        goto fail;
-    }
+    if (load_file(db) != 0) goto fail;
     return YUI_OK;
 fail:
     close(db->fd);
@@ -2126,35 +2410,13 @@ const char *yui_errmsg(yui *db) {
 const char *yui_notice(yui *db) { return db ? db->notice : NULL; }
 
 int yui_close(yui *db) {
-    size_t i;
     int rc = YUI_OK;
     if (!db) return YUI_OK;
     if (db->fd >= 0) {
         if (fsync(db->fd) != 0) rc = YUI_ERROR;
         if (close(db->fd) != 0) rc = YUI_ERROR;
     }
-    for (i = 0; i < db->nn; i++) {
-        Node *x = &db->nodes[i];
-        free(x->label);
-        free(x->name);
-        attrs_free(x->attrs, x->nattrs);
-        free(x->out.v);
-        free(x->in.v);
-    }
-    for (i = 0; i < db->ne; i++) {
-        free(db->edges[i].type);
-        attrs_free(db->edges[i].attrs, db->edges[i].nattrs);
-    }
-    free(db->nodes);
-    free(db->edges);
-    map_free(&db->m_key);
-    map_free(&db->m_name);
-    map_free(&db->m_label);
-    map_free(&db->m_edge);
-    for (i = 0; i < db->gramcap; i++) free(db->grams[i].list.v);
-    free(db->grams);
-    arena_reset(&db->stmt);
-    arena_reset(&db->scratch);
+    free_state(db);
     free(db->err);
     free(db->notice);
     free(db->path);

@@ -68,22 +68,59 @@ typedef long long ssize_t;
  *   CLI は argv を UTF-8 に直してから渡しますが（yui_cli.c の★）、
  *   ライブラリとして組み込む側が ANSI のパスを渡すことはあるためです。
  */
-static int yui_win_open(const char *path, int flags, int mode) {
-    int pmode = (mode & 0200) ? (_S_IREAD | _S_IWRITE) : _S_IREAD;
+static wchar_t *yui_win_wide(const char *path) {
     wchar_t *w;
-    int n, fd;
-    flags |= _O_BINARY;
-    n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, NULL, 0);
-    if (n <= 0) return _open(path, flags, pmode);
+    int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, NULL, 0);
+    if (n <= 0) return NULL;
     w = (wchar_t *)malloc((size_t)n * sizeof *w);
-    if (!w) return _open(path, flags, pmode);
+    if (!w) return NULL;
     if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, w, n) <= 0) {
         free(w);
-        return _open(path, flags, pmode);
+        return NULL;
     }
+    return w;
+}
+
+static int yui_win_open(const char *path, int flags, int mode) {
+    int pmode = (mode & 0200) ? (_S_IREAD | _S_IWRITE) : _S_IREAD;
+    wchar_t *w = yui_win_wide(path);
+    int fd;
+    flags |= _O_BINARY;
+    if (!w) return _open(path, flags, pmode);
     fd = _wopen(w, flags, pmode);
     free(w);
     return fd;
+}
+
+/*
+ * rename の代わり。MSVC の rename は行き先が在ると失敗するので、
+ * 上書きする MoveFileExW を使います（POSIX の rename に合わせます）。
+ * ★行き先を開いたままでは入れ替えられません（Windows はファイルを掴みます）。
+ *   詰め直す は、入れ替える前に自分の fd を閉じています。
+ * ★失敗の本当の理由は GetLastError にしか無いので、errno には
+ *   EACCES（「Permission denied」）を入れます。実際いちばん多いのが
+ *   「ほかで開かれている」なので、文面としても近い値を選びました。
+ */
+static int yui_win_rename(const char *from, const char *to) {
+    wchar_t *wf = yui_win_wide(from), *wt = yui_win_wide(to);
+    int rc = -1;
+    if (wf && wt && MoveFileExW(wf, wt, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+        rc = 0;
+    else
+        errno = EACCES;
+    free(wf);
+    free(wt);
+    return rc;
+}
+
+/* remove の代わり。パスを UTF-16 に直します（上の★）。 */
+static int yui_win_remove(const char *path) {
+    wchar_t *w = yui_win_wide(path);
+    int rc;
+    if (!w) return _unlink(path);
+    rc = _wunlink(w);
+    free(w);
+    return rc;
 }
 
 /* read の代わり。size_t を Windows の unsigned int 幅に収めます。 */
@@ -139,6 +176,8 @@ static int yui_win_flock(int fd, int op) {
  * 置き換えてしまう心配はありません。
  */
 #define open      yui_win_open
+#define rename    yui_win_rename
+#define remove    yui_win_remove
 #define read      yui_win_read
 #define write     yui_win_write
 #define ftruncate yui_win_ftruncate

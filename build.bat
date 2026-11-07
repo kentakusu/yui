@@ -18,7 +18,7 @@ setlocal enabledelayedexpansion
 
 if "%1"=="clean" (
   del /q yui.exe yui_test.exe *.obj *.pdb *.ilk 2>nul
-  del /q yui_test_tmp.yui "yui_test_tmp.yui.断片" 2>nul
+  del /q yui_test_tmp.yui "yui_test_tmp.yui.断片" "yui_test_tmp.yui.詰" 2>nul
   echo 消しました
   exit /b 0
 )
