@@ -2,6 +2,7 @@
  * 結（yui）の CLI。
  *   yui ファイル                対話（端末でなければ、標準入力を 1 行ずつ実行）
  *   yui ファイル "問い合わせ"     1 回だけ実行
+ *   yui --json …                1 行を 1 つの JSON で出す（機械で読むとき）
  * 失敗があれば終了コードは 1 です。
  */
 #define _POSIX_C_SOURCE 200809L
@@ -72,6 +73,37 @@ static int print_row(void *ctx, int kind, const char *text) {
 }
 
 /*
+ * --json のときの失敗の出し方。1 行 1 つの JSON で、標準エラーへ出します。
+ * ★本体の yui_exec_json は結果だけを JSON にします。失敗の理由は
+ *   yui_errmsg() が返す人向けの文なので、包むのは呼ぶ側（ここ）の仕事です。
+ * ★包む相手は結の出した文ですが、その中に利用者が書いた名前が入ります。
+ *   引用符や改行が混ざっても壊れないように、ここで逃がします。
+ */
+static void print_json_err(unsigned long lineno, const char *text) {
+    fputs("{\"kind\":\"error\"", stderr);
+    if (lineno) fprintf(stderr, ",\"line\":%lu", lineno);
+    fputs(",\"text\":\"", stderr);
+    for (; *text; text++) {
+        unsigned char c = (unsigned char)*text;
+        if (c == '"' || c == '\\') {
+            fputc('\\', stderr);
+            fputc((char)c, stderr);
+        } else if (c == '\n') {
+            fputs("\\n", stderr);
+        } else if (c == '\t') {
+            fputs("\\t", stderr);
+        } else if (c == '\r') {
+            fputs("\\r", stderr);
+        } else if (c < 0x20) {
+            fprintf(stderr, "\\u%04x", c);
+        } else {
+            fputc((char)c, stderr);
+        }
+    }
+    fputs("\"}\n", stderr);
+}
+
+/*
  * 1 行読む。長さの制限はありません。入力が尽きたら NULL。
  * *len に読んだバイト数を入れます（終わりの改行を含む）。
  *
@@ -110,9 +142,22 @@ static char *read_line(FILE *f, size_t *len) {
     return b;
 }
 
+/* 失敗を 1 行 出す。--json なら JSON で */
+static void say_err(int json, unsigned long lineno, const char *text) {
+    fflush(stdout);
+    if (json) {
+        print_json_err(lineno, text);
+    } else if (lineno) {
+        fprintf(stderr, "エラー: %lu 行目: %s\n", lineno, text);
+    } else {
+        fprintf(stderr, "エラー: %s\n", text);
+    }
+}
+
 int main(int argc, char **argv) {
     yui *db;
-    int failed = 0, tty, rc;
+    int failed = 0, tty, rc, json = 0, ai = 1;
+    const char *path, *query = NULL;
     char *line;
 #ifdef _WIN32
     {
@@ -124,20 +169,29 @@ int main(int argc, char **argv) {
         }
     }
 #endif
-    if (argc < 2 || argc > 3) {
-        fprintf(stderr, "使い方: %s ファイル [問い合わせ]\n", argv[0]);
+    if (argc > 1 && strcmp(argv[1], "--json") == 0) {
+        json = 1;
+        ai = 2;
+    }
+    if (argc - ai < 1 || argc - ai > 2) {
+        fprintf(stderr, "使い方: %s [--json] ファイル [問い合わせ]\n", argv[0]);
         return 2;
     }
-    if (yui_open(argv[1], &db) != YUI_OK) {
-        fprintf(stderr, "エラー: %s\n", yui_errmsg(db));
+    path = argv[ai];
+    if (argc - ai == 2) query = argv[ai + 1];
+    if (yui_open(path, &db) != YUI_OK) {
+        say_err(json, 0, yui_errmsg(db));
         yui_close(db);
         return 1;
     }
+    /* ★お知らせは、--json でも人向けの文のまま標準エラーへ出します。
+     *   結果（標準出力）に混ぜないので、機械で読む側の邪魔にはなりません。 */
     if (yui_notice(db)) fprintf(stderr, "お知らせ: %s\n", yui_notice(db));
-    if (argc == 3) {
-        rc = yui_exec(db, argv[2], print_row, NULL);
+    if (query) {
+        rc = json ? yui_exec_json(db, query, print_row, NULL)
+                  : yui_exec(db, query, print_row, NULL);
         if (rc == YUI_ERROR) {
-            fprintf(stderr, "エラー: %s\n", yui_errmsg(db));
+            say_err(json, 0, yui_errmsg(db));
             failed = 1;
         }
     } else {
@@ -161,23 +215,23 @@ int main(int argc, char **argv) {
              *   どこに NUL があるかを知っているのは、バイト数で読んだここだけです。
              */
             if (strlen(line) != len) {
-                fflush(stdout);
-                fprintf(stderr,
-                        "エラー: %lu 行目の %lu バイト目に NUL（文字コード 0）が"
-                        "入っています。問い合わせに NUL は書けません\n",
-                        lineno, (unsigned long)strlen(line) + 1);
+                char b[160];
+                snprintf(b, sizeof b,
+                         "%lu バイト目に NUL（文字コード 0）が入っています。"
+                         "問い合わせに NUL は書けません",
+                         (unsigned long)strlen(line) + 1);
+                say_err(json, lineno, b);
                 failed = 1;
                 free(line);
                 continue; /* この行だけ飛ばして、次の行へ進みます */
             }
-            rc = yui_exec(db, line, print_row, NULL);
+            rc = json ? yui_exec_json(db, line, print_row, NULL)
+                      : yui_exec(db, line, print_row, NULL);
             free(line);
             if (rc == YUI_ERROR) {
-                fflush(stdout);
                 /* ★行番号は、流し込みのときだけ出します。
                  *   対話では「1 行目」と言われても手がかりになりません。 */
-                if (tty) fprintf(stderr, "エラー: %s\n", yui_errmsg(db));
-                else fprintf(stderr, "エラー: %lu 行目: %s\n", lineno, yui_errmsg(db));
+                say_err(json, tty ? 0 : lineno, yui_errmsg(db));
                 failed = 1;
                 /* ★止めません。次の行へ進みます。300 行 流して 1 行 間違っていた
                  *   ときに、残りを全部 捨てるほうが困るためです。
@@ -190,7 +244,7 @@ int main(int argc, char **argv) {
         }
     }
     if (yui_close(db) != YUI_OK) {
-        fprintf(stderr, "エラー: 閉じるときの書き出しに失敗しました\n");
+        say_err(json, 0, "閉じるときの書き出しに失敗しました");
         failed = 1;
     }
     return failed;

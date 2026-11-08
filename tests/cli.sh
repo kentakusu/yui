@@ -105,6 +105,35 @@ check "日本語のファイル名が開けること" 0 $?
 "$YUI" "$D/t5.yui" < "$D/in4.txt" > /dev/null 2>&1
 check "空の入力の終了コード" 0 $?
 
+# ---------------------------------------------------------------- --json
+
+"$YUI" --json "$D/j1.yui" '作る (人:田中 {役職: "部長"})' > "$D/j1.out" 2>&1
+check "--json の終了コード" 0 $?
+first=$(head -1 "$D/j1.out")
+has '"kind":"node"' "$first" "--json で点が kind=node で出ること"
+has '"label":"人"' "$first" "--json でラベルが鍵で取れること"
+last=$(tail -1 "$D/j1.out")
+has '"kind":"summary"' "$last" "--json で締めが kind=summary で出ること"
+
+# 1 行 1 つの JSON になっていること（{ で始まり } で終わる行だけ）
+bad=$(grep -c -v '^{.*}$' "$D/j1.out" 2>/dev/null || true)
+check "--json の出力が 1 行 1 つの JSON であること" 0 "$bad"
+
+# 失敗も JSON で、標準エラーへ
+err=$("$YUI" --json "$D/j1.yui" 'これは誤り' 2>&1 > /dev/null)
+has '"kind":"error"' "$err" "--json で失敗が kind=error で出ること"
+
+# 流し込みのときは、何行目かも JSON に入る
+printf '作る (点:一)
+これは誤り
+' > "$D/j2in.txt"
+err=$("$YUI" --json "$D/j2.yui" < "$D/j2in.txt" 2>&1 > /dev/null)
+has '"line":2' "$err" "--json で何行目かが入ること"
+
+# --json だけ渡したら使い方
+"$YUI" --json > /dev/null 2>&1
+check "--json だけ渡したときの終了コード" 2 $?
+
 # ---------------------------------------------------------------- 締め
 
 if [ "$ng" -eq 0 ]; then

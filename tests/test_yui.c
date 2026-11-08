@@ -632,6 +632,101 @@ static void direct_tests(void) {
     ok("断ったとき、人が置いた .詰 を消さないこと", body != NULL && len == 12, NULL);
     free(body);
 
+    /* 10. 機械で読む形（yui_exec_json）
+     *     ★ケースのファイル（tests/cases の中）は人が読む形を見ているので、
+     *       JSON はここで直に見ます。行の数と順は yui_exec と同じはずです。 */
+    clean();
+    if (yui_open(TMP, &db) == YUI_OK) {
+        yui_exec(db,
+                 "作る (発言:x1 {日時: \"07:30\", 話者: \"本人\", 順: 1, 重み: 0.5})\n"
+                 "作る (発言:x2 {日時: \"08:00\"})\n"
+                 "結ぶ (日:2026-11-08)-[含む {順: 1}]->(発言:x1)",
+                 NULL, NULL);
+
+        memset(&g, 0, sizeof g);
+        yui_exec_json(db, "一覧 (発言:)", collect, &g);
+        ok("点が kind=node で出ること", g.n == 3 && strstr(g.text[0], "\"kind\":\"node\"") != NULL,
+           g.n ? g.text[0] : NULL);
+        ok("ラベルと名前が鍵で取れること",
+           g.n == 3 && strstr(g.text[0], "\"label\":\"発言\"") != NULL &&
+               strstr(g.text[0], "\"name\":\"x1\"") != NULL,
+           g.n ? g.text[0] : NULL);
+        ok("数は数のまま出ること（引用符を付けない）",
+           g.n == 3 && strstr(g.text[0], "\"順\":1") != NULL &&
+               strstr(g.text[0], "\"重み\":0.5") != NULL,
+           g.n ? g.text[0] : NULL);
+        ok("締めに件数が数で入ること",
+           g.n == 3 && strstr(g.text[2], "\"kind\":\"summary\"") != NULL &&
+               strstr(g.text[2], "\"count\":2") != NULL,
+           g.n == 3 ? g.text[2] : NULL);
+        rows_free(&g);
+
+        /* ★人が読む形と行の数が同じこと。片方だけ増えたら、どちらかが壊れています */
+        {
+            Rows a, b;
+            memset(&a, 0, sizeof a);
+            memset(&b, 0, sizeof b);
+            yui_exec(db, "一覧 (発言:)", collect, &a);
+            yui_exec_json(db, "一覧 (発言:)", collect, &b);
+            ok("人が読む形と JSON で、行の数が同じこと", a.n == b.n, NULL);
+            rows_free(&a);
+            rows_free(&b);
+        }
+
+        /* ★引用符・改行・バックスラッシュが壊れないこと。
+         *   これが壊れていると、読む側が落ちます（しかも値は出ているように見えます）。 */
+        yui_exec(db, "作る (メモ:m1 {本文: \"引用\\\"と改行\\nと\\\\ です\"})", NULL, NULL);
+        memset(&g, 0, sizeof g);
+        yui_exec_json(db, "一覧 (メモ:)", collect, &g);
+        ok("引用符を逃がすこと", g.n && strstr(g.text[0], "引用\\\"と") != NULL,
+           g.n ? g.text[0] : NULL);
+        ok("改行を逃がすこと", g.n && strstr(g.text[0], "と改行\\nと") != NULL,
+           g.n ? g.text[0] : NULL);
+        ok("バックスラッシュを逃がすこと", g.n && strstr(g.text[0], "\\\\ です") != NULL,
+           g.n ? g.text[0] : NULL);
+        rows_free(&g);
+
+        /* 辿る の道 */
+        memset(&g, 0, sizeof g);
+        yui_exec_json(db, "辿る (日:2026-11-08)-[含む]->(?発言)", collect, &g);
+        ok("道が kind=path で出ること", g.n == 2 && strstr(g.text[0], "\"kind\":\"path\"") != NULL,
+           g.n ? g.text[0] : NULL);
+        ok("道に nodes と edges が入ること",
+           g.n == 2 && strstr(g.text[0], "\"nodes\":[") != NULL &&
+               strstr(g.text[0], "\"edges\":[") != NULL,
+           g.n ? g.text[0] : NULL);
+        ok("道が二重に包まれないこと（kind=text にならない）",
+           g.n == 2 && strstr(g.text[0], "\"kind\":\"text\"") == NULL, g.n ? g.text[0] : NULL);
+        rows_free(&g);
+
+        /* 見る のつながり */
+        memset(&g, 0, sizeof g);
+        yui_exec_json(db, "見る (発言:x1)", collect, &g);
+        ok("つながりが kind=link で出ること",
+           g.n == 3 && strstr(g.text[1], "\"kind\":\"link\"") != NULL &&
+               strstr(g.text[1], "\"dir\":\"in\"") != NULL,
+           g.n > 1 ? g.text[1] : NULL);
+        rows_free(&g);
+
+        /* 手引き のような人向けの行 */
+        memset(&g, 0, sizeof g);
+        yui_exec_json(db, "手引き", collect, &g);
+        ok("人向けの行が kind=text で出ること",
+           g.n > 10 && strstr(g.text[0], "\"kind\":\"text\"") != NULL, g.n ? g.text[0] : NULL);
+        rows_free(&g);
+
+        /* ★JSON を頼んだ次の yui_exec は、人が読む形に戻ること */
+        memset(&g, 0, sizeof g);
+        yui_exec(db, "一覧 (発言:)", collect, &g);
+        ok("次の yui_exec は人が読む形に戻ること",
+           g.n == 3 && g.text[0][0] == '(' && strstr(g.text[0], "\"kind\"") == NULL,
+           g.n ? g.text[0] : NULL);
+        rows_free(&g);
+    } else {
+        ok("下ごしらえ（機械で読む形）", 0, yui_errmsg(db));
+    }
+    yui_close(db);
+
     /* まだ見ていないもの。黙っていると「見た」と読まれるので、毎回 出します */
     skip("詰め直す の失敗の道",
          "書けない・読めない・入れ替えられないときの振る舞いは、まだ通していません"

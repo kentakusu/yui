@@ -308,6 +308,7 @@ struct yui {
     yui_cb cb;
     void *ctx;
     int stopped;
+    int json; /* 1 なら 1 行 1 つの JSON で出す（yui_exec_json） */
     int in_replay;
 };
 
@@ -1136,19 +1137,160 @@ static void print_edge(yui *db, Str *o, u64 id, const Show *sh) {
     print_node(db, o, e->to, node_show(sh));
 }
 
-static void emit(yui *db, int kind, const char *text) {
+/* ---------------------------------------------------------- 機械で読む形
+ *
+ * 1 行に 1 つの JSON を出します（JSON Lines）。yui_exec_json で切り替えます。
+ *
+ * ★鍵は ASCII です。値（ラベル・名前・属性）は日本語のまま UTF-8 で出します。
+ *   関数名を ASCII にしているのと同じ理由です —— 読むのは機械なので、
+ *   どの言語からも書きやすい形にしています。表に出る言葉は日本語のままです。
+ * ★行の種類は "kind" で分かります: node / edge / path / link / text / summary。
+ *   人が読む形の行と 1 対 1 です（同じ問い合わせなら、行の数も順も同じ）。
+ */
+static void json_str(Str *o, const char *s) {
+    str_chr(o, '"');
+    for (; *s; s++) {
+        unsigned char c = (unsigned char)*s;
+        if (c == '"' || c == '\\') {
+            str_chr(o, '\\');
+            str_chr(o, (char)c);
+        } else if (c == '\n') {
+            str_add(o, "\\n");
+        } else if (c == '\t') {
+            str_add(o, "\\t");
+        } else if (c == '\r') {
+            str_add(o, "\\r");
+        } else if (c < 0x20) {
+            /* ★JSON では 0x20 より小さい字をそのまま書けません */
+            char b[8];
+            snprintf(b, sizeof b, "\\u%04x", c);
+            str_add(o, b);
+        } else {
+            str_chr(o, (char)c);
+        }
+    }
+    str_chr(o, '"');
+}
+static void json_value(Str *o, const Value *v) {
+    char b[64];
+    if (v->type == V_STR) {
+        json_str(o, v->s);
+        return;
+    }
+    if (v->type == V_INT) {
+        snprintf(b, sizeof b, "%lld", (long long)v->i);
+        str_add(o, b);
+        return;
+    }
+    /* ★JSON に inf と nan は書けないので null にします（読む側が落ちないように）。
+     *   いまは問い合わせの側で弾いているので、入ってこない見込みです。 */
+    if (!(v->d == v->d) || v->d - v->d != 0.0) {
+        str_add(o, "null");
+        return;
+    }
+    snprintf(b, sizeof b, "%.17g", v->d);
+    str_add(o, b);
+}
+/* ,"attrs":{...} を足す。Show の指示に従う（名前だけ・見せる） */
+static void json_attrs(Str *o, const Attr *a, size_t n, const Show *sh) {
+    size_t i, j, out = 0;
+    str_add(o, ",\"attrs\":{");
+    if (sh->all) {
+        for (i = 0; i < n; i++) {
+            if (out++) str_chr(o, ',');
+            json_str(o, a[i].key);
+            str_chr(o, ':');
+            json_value(o, &a[i].v);
+        }
+    } else {
+        for (i = 0; i < sh->nkeys; i++)
+            for (j = 0; j < n; j++)
+                if (strcmp(a[j].key, sh->keys[i]) == 0) {
+                    if (out++) str_chr(o, ',');
+                    json_str(o, a[j].key);
+                    str_chr(o, ':');
+                    json_value(o, &a[j].v);
+                    break;
+                }
+    }
+    str_chr(o, '}');
+}
+/* {"label":…,"name":…,"attrs":{…}} の中身（括弧は呼ぶ側が書く） */
+static void json_node_body(yui *db, Str *o, u64 id, const Show *sh) {
+    Node *x = &db->nodes[id - 1];
+    str_add(o, "\"label\":");
+    json_str(o, x->label);
+    str_add(o, ",\"name\":");
+    json_str(o, x->name);
+    json_attrs(o, x->attrs, x->nattrs, sh);
+}
+static void json_node(yui *db, Str *o, u64 id, const Show *sh) {
+    str_add(o, "{\"kind\":\"node\",");
+    json_node_body(db, o, id, sh);
+    str_chr(o, '}');
+}
+static void json_edge(yui *db, Str *o, u64 id, const Show *sh) {
+    Edge *e = &db->edges[id - 1];
+    str_add(o, "{\"kind\":\"edge\",\"type\":");
+    json_str(o, e->type);
+    str_add(o, ",\"from\":{");
+    json_node_body(db, o, e->from, node_show(sh));
+    str_add(o, "},\"to\":{");
+    json_node_body(db, o, e->to, node_show(sh));
+    str_chr(o, '}');
+    json_attrs(o, e->attrs, e->nattrs, sh);
+    str_chr(o, '}');
+}
+
+/* 組み立て済みの 1 行をそのまま渡す（JSON の行はこちらを使います） */
+static void emit_raw(yui *db, int kind, const char *text) {
     if (db->stopped || !db->cb) return;
     if (db->cb(db->ctx, kind, text)) db->stopped = 1;
 }
+/* 人が読む文を渡す。JSON のときは 1 つに包みます */
+static void emit(yui *db, int kind, const char *text) {
+    if (db->stopped || !db->cb) return;
+    if (!db->json) {
+        emit_raw(db, kind, text);
+        return;
+    }
+    {
+        Str o = {0};
+        str_add(&o, kind == YUI_SUMMARY ? "{\"kind\":\"summary\",\"text\":"
+                                        : "{\"kind\":\"text\",\"text\":");
+        json_str(&o, text);
+        str_chr(&o, '}');
+        emit_raw(db, kind, o.p);
+        free(o.p);
+    }
+}
+/* 組み立てた 1 行をそのまま出す。
+ * ★emit ではなく emit_raw を通します。JSON のときに print_path が作った
+ *   JSON を、emit がもう一度 包んでしまうためです（実測で二重になりました）。
+ *   人が読む形では emit と同じです（emit は包まずに emit_raw へ渡すだけ）。 */
 static void emit_str(yui *db, Str *o) {
-    emit(db, YUI_ROW, o->p ? o->p : "");
+    emit_raw(db, YUI_ROW, o->p ? o->p : "");
     str_clear(o);
 }
 static void emit_count(yui *db, size_t n, const char *suffix) {
     /* ★手がかり（label_hint）を添えることがあるので、短い桁では足りません */
     char b[256];
     snprintf(b, sizeof b, "%llu 件%s", (unsigned long long)n, suffix);
-    emit(db, YUI_SUMMARY, b);
+    if (!db->json) {
+        emit(db, YUI_SUMMARY, b);
+        return;
+    }
+    /* ★JSON のときは件数を数として添えます。文を切り分けずに数えられるように */
+    {
+        Str o = {0};
+        char c[40];
+        str_add(&o, "{\"kind\":\"summary\",\"text\":");
+        json_str(&o, b);
+        snprintf(c, sizeof c, ",\"count\":%llu}", (unsigned long long)n);
+        str_add(&o, c);
+        emit_raw(db, YUI_SUMMARY, o.p);
+        free(o.p);
+    }
 }
 
 /* ------------------------------------------------------------------ 文法 */
@@ -1704,17 +1846,18 @@ static const char *status_word(int status) {
     return status == 1 ? "作りました" : status == 2 ? "更新しました" : "変わりません";
 }
 
+/* 1 行 出す。本体は下の「結果を出す」の節にあります（JSON もそこで分かれます） */
+static void emit_doc(yui *db, u64 doc, const Show *sh);
+
 static int cmd_make(P *p) {
     yui *db = p->db;
     NodePat n;
     u64 id;
     int st;
-    Str o = {0};
     if (parse_node(p, &n, 1) != 0) return -1;
     if (ensure_node(db, &n, &id, &st) != 0) return -1;
-    print_node(db, &o, id, &SHOW_ALL);
-    emit_str(db, &o);
-    free(o.p);
+    /* ★emit_doc を通します。人が読む形は今までと同じで、JSON もここで効きます */
+    emit_doc(db, DOC_NODE(id), &SHOW_ALL);
     emit(db, YUI_SUMMARY, status_word(st));
     return 0;
 }
@@ -1725,7 +1868,6 @@ static int cmd_link(P *p) {
     EdgePat e;
     u64 ia, ib, ie, cur;
     int sa, sb, st;
-    Str o = {0};
     if (parse_node(p, &a, 1) != 0) return -1;
     if (parse_edge(p, &e, 1, 0) != 0) return -1;
     if (parse_node(p, &b, 1) != 0) return -1;
@@ -1747,20 +1889,50 @@ static int cmd_link(P *p) {
         ib = t;
     }
     if (put_edge(db, ia, ib, e.type, e.attrs.a, e.attrs.n, &ie, &st) != 0) return -1;
-    print_edge(db, &o, ie, &SHOW_ALL);
-    emit_str(db, &o);
-    free(o.p);
+    emit_doc(db, DOC_EDGE(ie), &SHOW_ALL);
     emit(db, YUI_SUMMARY, status_word(st));
     return 0;
 }
 
+
 /* 属性の出し方は Show が決める（名前だけ・見せる。parse_mods を見よ） */
 static void emit_doc(yui *db, u64 doc, const Show *sh) {
     Str o = {0};
+    if (db->json) {
+        if (doc & 1) json_edge(db, &o, doc >> 1, sh);
+        else json_node(db, &o, doc >> 1, sh);
+        emit_raw(db, YUI_ROW, o.p ? o.p : "");
+        free(o.p);
+        return;
+    }
     if (doc & 1) print_edge(db, &o, doc >> 1, sh);
     else print_node(db, &o, doc >> 1, sh);
     emit_str(db, &o);
     free(o.p);
+}
+
+/*
+ * 見る の「つながり」の 1 行。forward は線を out 向きに見ているかどうか。
+ * ★人が読む形では 2 文字 下げた 1 行、JSON では kind=link の 1 つになります。
+ */
+static void emit_link(yui *db, Str *o, const Edge *e, int forward, u64 other) {
+    if (db->json) {
+        str_add(o, "{\"kind\":\"link\",\"dir\":");
+        str_add(o, forward ? "\"out\"" : "\"in\"");
+        str_add(o, ",\"type\":");
+        json_str(o, e->type);
+        json_attrs(o, e->attrs, e->nattrs, &SHOW_ALL);
+        str_add(o, ",\"other\":{");
+        json_node_body(db, o, other, &NONE);
+        str_add(o, "}}");
+        emit_raw(db, YUI_ROW, o->p ? o->p : "");
+        str_clear(o);
+        return;
+    }
+    str_add(o, "  ");
+    print_edge_step(o, e, forward, &SHOW_ALL);
+    print_node(db, o, other, &NONE);
+    emit_str(db, o);
 }
 
 /*
@@ -1894,6 +2066,35 @@ static void print_path(yui *db, Str *o, u64 start, u64 last_node, u64 edge, u64 
         vec_push(&edges, db->nodes[cur - 1].via_edge);
         cur = db->nodes[cur - 1].via_node;
     }
+    if (db->json) {
+        /* ★道は点と線の並びとして出します。nodes は edges より 1 つ多いです。
+         *   forward は、その線をどちら向きに通ったかです（人が読む形の -> と <- に当たります）。 */
+        str_add(o, "{\"kind\":\"path\",\"nodes\":[{");
+        json_node_body(db, o, start, node_show(sh));
+        str_chr(o, '}');
+        for (i = nodes.n; i > 0; i--) {
+            str_add(o, ",{");
+            json_node_body(db, o, nodes.v[i - 1], node_show(sh));
+            str_chr(o, '}');
+        }
+        str_add(o, "],\"edges\":[");
+        cur = start;
+        for (i = nodes.n; i > 0; i--) {
+            Edge *e = &db->edges[edges.v[i - 1] - 1];
+            u64 nx = nodes.v[i - 1];
+            if (i != nodes.n) str_chr(o, ',');
+            str_add(o, "{\"type\":");
+            json_str(o, e->type);
+            str_add(o, e->from == cur && e->to == nx ? ",\"forward\":true" : ",\"forward\":false");
+            json_attrs(o, e->attrs, e->nattrs, sh);
+            str_chr(o, '}');
+            cur = nx;
+        }
+        str_add(o, "]}");
+        free(nodes.v);
+        free(edges.v);
+        return;
+    }
     print_node(db, o, start, node_show(sh));
     cur = start;
     for (i = nodes.n; i > 0; i--) {
@@ -2022,7 +2223,7 @@ static int cmd_walk(P *p) {
         }
     }
     if (lim) {
-        for (s = 0; s < top.n && !db->stopped; s++) emit(db, YUI_ROW, top.v[s].s);
+        for (s = 0; s < top.n && !db->stopped; s++) emit_raw(db, YUI_ROW, top.v[s].s);
         count = top.n;
         top_free(&top);
     }
@@ -2043,23 +2244,16 @@ static int cmd_show(P *p) {
     collect_nodes(db, &n, &v);
     for (i = 0; i < v.n && !db->stopped; i++) {
         Node *x = &db->nodes[v.v[i] - 1];
-        print_node(db, &o, v.v[i], &SHOW_ALL);
-        emit_str(db, &o);
+        emit_doc(db, DOC_NODE(v.v[i]), &SHOW_ALL);
         for (j = 0; j < x->out.n; j++) {
             Edge *e = &db->edges[x->out.v[j] - 1];
             if (!e->live) continue;
-            str_add(&o, "  ");
-            print_edge_step(&o, e, 1, &SHOW_ALL);
-            print_node(db, &o, e->to, &NONE);
-            emit_str(db, &o);
+            emit_link(db, &o, e, 1, e->to);
         }
         for (j = 0; j < x->in.n; j++) {
             Edge *e = &db->edges[x->in.v[j] - 1];
             if (!e->live || e->from == e->to) continue;
-            str_add(&o, "  ");
-            print_edge_step(&o, e, 0, &SHOW_ALL);
-            print_node(db, &o, e->from, &NONE);
-            emit_str(db, &o);
+            emit_link(db, &o, e, 0, e->from);
         }
     }
     emit_count(db, v.n, "");
@@ -2260,15 +2454,21 @@ static int exec_stmt(P *p) {
     return YUI_OK;
 }
 
-int yui_exec(yui *db, const char *query, yui_cb cb, void *ctx) {
+/*
+ * yui_exec と yui_exec_json の本体。違いは出し方（json）だけです。
+ * ★json はこの呼び出しの間だけ立てます。次の yui_exec が人が読む形に戻るように。
+ */
+static int exec_all(yui *db, const char *query, yui_cb cb, void *ctx, int json) {
     P p;
     int rc = YUI_OK;
     if (!db || db->fd < 0) return YUI_ERROR;
+    db->json = json;
     free(db->err);
     db->err = NULL;
     if (!query) query = "";
     if (!utf8_valid(query)) {
         set_err(db, "問い合わせが UTF-8 として正しくありません");
+        db->json = 0;
         return YUI_ERROR;
     }
     db->cb = cb;
@@ -2282,7 +2482,15 @@ int yui_exec(yui *db, const char *query, yui_cb cb, void *ctx) {
     }
     db->cb = NULL;
     db->ctx = NULL;
+    db->json = 0;
     return rc;
+}
+
+int yui_exec(yui *db, const char *query, yui_cb cb, void *ctx) {
+    return exec_all(db, query, cb, ctx, 0);
+}
+int yui_exec_json(yui *db, const char *query, yui_cb cb, void *ctx) {
+    return exec_all(db, query, cb, ctx, 1);
 }
 
 /* ------------------------------------------------------------------ 開く */

@@ -65,6 +65,24 @@ int yui_open(const char *path, yui **db);
  */
 int yui_exec(yui *db, const char *query, yui_cb cb, void *ctx);
 
+/*
+ * yui_exec と同じですが、1 行を 1 つの JSON で返します（JSON Lines）。
+ * 行の数と順は yui_exec と同じです。
+ *
+ * ★鍵は ASCII です。値（ラベル・名前・属性）は日本語のまま UTF-8 で入ります。
+ * ★行の種類は "kind" で分かります。
+ *     node     {"kind":"node","label":…,"name":…,"attrs":{…}}
+ *     edge     {"kind":"edge","type":…,"from":{…},"to":{…},"attrs":{…}}
+ *     path     {"kind":"path","nodes":[…],"edges":[{"type":…,"forward":真偽,"attrs":{…}}]}
+ *              （辿る の道。nodes は edges より 1 つ多い）
+ *     link     {"kind":"link","dir":"out"|"in","type":…,"attrs":{…},"other":{…}}
+ *              （見る のつながり）
+ *     text     {"kind":"text","text":…}（手引き など、人へのそのままの 1 行）
+ *     summary  {"kind":"summary","text":…}。件数が分かるときは "count" も入る
+ * ★失敗の理由は JSON になりません。今までどおり yui_errmsg() で読んでください。
+ */
+int yui_exec_json(yui *db, const char *query, yui_cb cb, void *ctx);
+
 /* 直前の失敗の理由。失敗していなければ空文字列です。 */
 const char *yui_errmsg(yui *db);
 
