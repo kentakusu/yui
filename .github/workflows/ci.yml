@@ -212,6 +212,31 @@ jobs:
             throw "持続接続で 2 回 返っていません: $out"
           }
 
+          # ★返りの上限（別のファイル・別のポートで。同じファイルには
+          #   2 本 立てられません——先の 1 本が錠を持っているので）
+          .\yui.exe cap.yui "作る (人:甲)" | Out-Null
+          .\yui.exe cap.yui "作る (人:乙)" | Out-Null
+          .\yui.exe cap.yui "作る (人:丙)" | Out-Null
+          $c = Start-Process -FilePath ".\yuid.exe" `
+            -ArgumentList "cap.yui","--port","39242","--idle","60","--max-rows","2" `
+            -PassThru -RedirectStandardError "cap.err" -NoNewWindow
+          $i = 0
+          while ($i -lt 100) {
+            if ((Test-Path "cap.err") -and (Get-Content "cap.err" -Raw) -match "で待っています") { break }
+            if ($c.HasExited) { break }
+            Start-Sleep -Milliseconds 100; $i++
+          }
+          $caplog = if (Test-Path "cap.err") { Get-Content "cap.err" -Raw } else { "" }
+          if ($caplog -notmatch "2 行まで") { throw "上限つきのデーモンが立ちません: $caplog" }
+          $out = (.\yuid_say.exe 39242 "一覧 (人:) 名前だけ" | Out-String)
+          if ($out -notmatch '"cut":true') { throw "上限で打ち切っていません: $out" }
+          if ($out -notmatch "打ち切りました") { throw "打ち切ったと言っていません: $out" }
+          if (($out | Select-String -AllMatches '"kind":"node"').Matches.Count -ne 2) {
+            throw "上限の行数だけ返していません: $out"
+          }
+          Stop-Process -Id $c.Id
+          Remove-Item "cap.yui.錠" -ErrorAction SilentlyContinue
+
           # ★2 本 目は立たないこと（Windows の SO_REUSEADDR は 2 つ目を通すので、
           #   SO_EXCLUSIVEADDRUSE が効いているかを見る段でもあります）
           $second = (.\yuid.exe d.yui --port 39240 2>&1 | Out-String)

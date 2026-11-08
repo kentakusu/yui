@@ -54,6 +54,7 @@ typedef SOCKET sock_t;
 #else
 #  include <arpa/inet.h>
 #  include <errno.h>
+#  include <fcntl.h>
 #  include <netinet/in.h>
 #  include <sys/select.h>
 #  include <sys/socket.h>
@@ -65,9 +66,18 @@ typedef int sock_t;
 #endif
 
 #define DEFAULT_PORT 39200
-#define MAX_CONN     16                        /* 同時に繋げる数 */
-#define MAX_REQ      (4UL * 1024UL * 1024UL)   /* 1 回の問い合わせの上限 */
+#define MAX_CONN     16                      /* 同時に繋げる数 */
+#define MAX_REQ      (4UL * 1024UL * 1024UL) /* 1 回の問い合わせの上限 */
 #define CHUNK        4096
+#define DEFAULT_MAX_ROWS 10000 /* 1 回の問い合わせで返す行の上限（0 で外せます） */
+/*
+ * ★読まないクライアントへの備え。待たずに送る作りにしても、相手が読まなければ
+ *   こちらの溜まりが増え続けます。だから 2 段で止めます。
+ *   HIGH_WATER を超えたら、その接続の新しい問い合わせを受け付けません。
+ *   MAX_OUT を超えたら、その接続を切ります（他のクライアントを守るため）。
+ */
+#define HIGH_WATER (1UL * 1024UL * 1024UL)
+#define MAX_OUT    (8UL * 1024UL * 1024UL)
 
 /* ★Ctrl-C で落ちると錠が残ります。合図を受けて、閉じてから終わります */
 static volatile sig_atomic_t stop_now = 0;
@@ -113,18 +123,47 @@ static void buf_drop(Buf *b, size_t n) {
 
 typedef struct {
     sock_t s;
-    Buf in; /* まだ 1 件に足りていないぶん */
+    Buf in;  /* まだ 1 件に足りていないぶん */
+    Buf out; /* まだ送れていないぶん */
+    /*
+     * ★「終わる を受けた」「形が違った」を接続に持たせます。回ごとの変数だと、
+     *   送り残しがある接続が切られずに残ります（溜まりを送り終えてから切るので）。
+     */
+    int bye;
 } Conn;
 
-static int send_all(sock_t s, const char *p, size_t n) {
-    while (n) {
-        SEND_LEN want = (SEND_LEN)(n > 65536 ? 65536 : n);
-        int k = (int)send(s, p, want, 0);
-        if (k <= 0) return -1;
-        p += k;
-        n -= (size_t)k;
+/*
+ * ★待たずに送ります。読まないクライアントが居ても、ここで止まりません。
+ *   0 = 進んだ（残りは out に溜まる）、-1 = 切れた
+ */
+static int send_some(Conn *c) {
+    while (c->out.n) {
+        SEND_LEN want = (SEND_LEN)(c->out.n > 65536 ? 65536 : c->out.n);
+        int k = (int)send(c->s, c->out.p, want, 0);
+        if (k > 0) {
+            buf_drop(&c->out, (size_t)k);
+            continue;
+        }
+#ifdef _WIN32
+        if (WSAGetLastError() == WSAEWOULDBLOCK) return 0;
+#else
+        if (errno == EINTR) continue;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
+#endif
+        return -1;
     }
     return 0;
+}
+
+/* 待たずに送る口にします */
+static void set_nonblock(sock_t s) {
+#ifdef _WIN32
+    u_long on = 1;
+    (void)ioctlsocket(s, FIONBIO, &on);
+#else
+    int fl = fcntl(s, F_GETFL, 0);
+    if (fl >= 0) (void)fcntl(s, F_SETFL, fl | O_NONBLOCK);
+#endif
 }
 
 /* 文字列を JSON の値として袋へ（引用符ごと） */
@@ -154,12 +193,33 @@ static void buf_json_str(Buf *b, const char *text) {
     buf_str(b, "\"");
 }
 
-/* yui からの 1 行を、この接続へ溜めます */
+/*
+ * 返す行の受け皿。★上限（max_rows）を超えたら打ち切ります。
+ *   上限が無いと、1 回の 探す が 10 万行 返したときに、その接続の
+ *   溜まりだけでメモリを食い、他のクライアントも待たされます。
+ */
+typedef struct {
+    Buf *out;
+    long max_rows; /* 0 なら上限なし */
+    long rows;
+    int cut; /* 1 なら上限で打ち切った */
+} Sink;
+
 static int out_row(void *ctx, int kind, const char *text) {
-    Buf *out = (Buf *)ctx;
+    Sink *k = (Sink *)ctx;
     (void)kind;
-    buf_str(out, text);
-    buf_str(out, "\n");
+    if (k->max_rows > 0 && k->rows >= k->max_rows) {
+        k->cut = 1;
+        /*
+         * ★0 以外を返すと、この yui_exec_json に渡した残りの文も実行されません
+         *   （yui.h の★）。1 行ずつ渡しているので、止まるのはこの行の中だけです。
+         *   そのうえで、この問い合わせの残りの行も進めません（下で見ます）。
+         */
+        return 1;
+    }
+    buf_str(k->out, text);
+    buf_str(k->out, "\n");
+    k->rows++;
     return 0;
 }
 
@@ -167,12 +227,17 @@ static int out_row(void *ctx, int kind, const char *text) {
  * 問い合わせ 1 件を実行して、返す中身を out に組みます。
  * 戻り値: 0 = 続ける、1 = この接続を切る（終わる を受けた）
  */
-static int run_req(yui *db, const char *body, size_t blen, Buf *out) {
+static int run_req(yui *db, const char *body, size_t blen, Buf *out, long max_rows) {
     size_t i = 0;
     unsigned long lineno = 0;
     int failed = 0, bye = 0;
+    Sink sink;
+    sink.out = out;
+    sink.max_rows = max_rows;
+    sink.rows = 0;
+    sink.cut = 0;
 
-    while (i <= blen && !bye) {
+    while (i <= blen && !bye && !sink.cut) {
         size_t j = i;
         char *line;
         int rc;
@@ -209,7 +274,7 @@ static int run_req(yui *db, const char *body, size_t blen, Buf *out) {
             buf_str(out, "}\n");
             failed = 1;
         } else {
-            rc = yui_exec_json(db, line, out_row, out);
+            rc = yui_exec_json(db, line, out_row, &sink);
             if (rc == YUI_ERROR) {
                 char nb[32];
                 buf_str(out, "{\"kind\":\"error\",\"line\":");
@@ -231,8 +296,25 @@ static int run_req(yui *db, const char *body, size_t blen, Buf *out) {
         i = j + 1;
     }
 
+    /*
+     * ★上限で打ち切ったことは、必ず言います。黙って切ると、
+     *   受け取った側は「これで全部」と読みます（気づけない欠配）。
+     */
+    if (sink.cut) {
+        char msg[200];
+        snprintf(msg, sizeof msg,
+                 "返りが %ld 行を超えたので打ち切りました。"
+                 "この問い合わせの残りの行も実行していません。"
+                 "「新しい N」で絞ってください",
+                 max_rows);
+        buf_str(out, "{\"kind\":\"error\",\"text\":");
+        buf_json_str(out, msg);
+        buf_str(out, "}\n");
+        failed = 1;
+    }
     buf_str(out, failed ? "{\"kind\":\"end\",\"rc\":1" : "{\"kind\":\"end\",\"rc\":0");
     if (bye) buf_str(out, ",\"bye\":true");
+    if (sink.cut) buf_str(out, ",\"cut\":true");
     buf_str(out, "}\n");
     return bye;
 }
@@ -286,11 +368,13 @@ static int take_req(Conn *c, char **body, size_t *blen, const char **why) {
 
 static void usage(const char *me) {
     fprintf(stderr,
-            "使い方: %s ファイル [--port N] [--idle 秒]\n"
+            "使い方: %s ファイル [--port N] [--idle 秒] [--max-rows N]\n"
             "  127.0.0.1 で待ち受けて、読むだけの問い合わせに答えます。\n"
-            "  --port  既定 %d\n"
-            "  --idle  誰も繋いでいない状態がこの秒数 続いたら終わります（既定 0＝終わらない）\n",
-            me, DEFAULT_PORT);
+            "  --port      既定 %d\n"
+            "  --idle      誰も繋いでいない状態がこの秒数 続いたら終わります（既定 0＝終わらない）\n"
+            "  --max-rows  1 回の問い合わせで返す行の上限（既定 %d・0 で外す）\n"
+            "              ★超えたら打ち切り、end に cut を付けて言います\n",
+            me, DEFAULT_PORT, DEFAULT_MAX_ROWS);
 }
 
 int main(int argc, char **argv) {
@@ -299,6 +383,7 @@ int main(int argc, char **argv) {
     sock_t lis = SOCK_BAD;
     struct sockaddr_in addr;
     int i, port = DEFAULT_PORT, idle = 0, nconn = 0, rc = 0, yes = 1;
+    long max_rows = DEFAULT_MAX_ROWS;
     const char *path = NULL;
     time_t last = time(NULL);
     char name[64];
@@ -326,6 +411,8 @@ int main(int argc, char **argv) {
             port = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--idle") == 0 && i + 1 < argc) {
             idle = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--max-rows") == 0 && i + 1 < argc) {
+            max_rows = atol(argv[++i]);
         } else if (argv[i][0] == '-') {
             usage(argv[0]);
             return 2;
@@ -336,7 +423,7 @@ int main(int argc, char **argv) {
             return 2;
         }
     }
-    if (!path || port <= 0 || port > 65535 || idle < 0) {
+    if (!path || port <= 0 || port > 65535 || idle < 0 || max_rows < 0) {
         usage(argv[0]);
         return 2;
     }
@@ -403,26 +490,37 @@ int main(int argc, char **argv) {
         return 1;
     }
     if (yui_notice(db)) fprintf(stderr, "yuid: お知らせ: %s\n", yui_notice(db));
-    fprintf(stderr, "yuid: 127.0.0.1:%d で待っています（読むだけ）: %s\n", port, path);
+    fprintf(stderr, "yuid: 127.0.0.1:%d で待っています（読むだけ・返りは %ld 行まで）: %s\n", port,
+            max_rows, path);
 
     while (!stop_now) {
-        fd_set rd;
+        fd_set rd, wr;
         struct timeval tv;
-        int ready, maxfd = 0;
+        int ready, maxfd = 0, nwr = 0;
         FD_ZERO(&rd);
+        FD_ZERO(&wr);
         FD_SET(lis, &rd);
 #ifndef _WIN32
         maxfd = (int)lis;
 #endif
         for (i = 0; i < nconn; i++) {
-            FD_SET(conns[i].s, &rd);
+            /*
+             * ★溜まりが多い接続からは、新しい問い合わせを読みません。
+             *   読むと、相手が読まないまま仕事が積み増されます。
+             */
+            if (conns[i].out.n < HIGH_WATER) FD_SET(conns[i].s, &rd);
+            if (conns[i].out.n) {
+                FD_SET(conns[i].s, &wr);
+                nwr++;
+            }
 #ifndef _WIN32
             if ((int)conns[i].s > maxfd) maxfd = (int)conns[i].s;
 #endif
         }
         tv.tv_sec = 1;
         tv.tv_usec = 0;
-        ready = select(maxfd + 1, &rd, NULL, NULL, &tv);
+        /* ★Windows の select は「空の集合」を渡せないので、必要なときだけ渡します */
+        ready = select(maxfd + 1, &rd, nwr ? &wr : NULL, NULL, &tv);
         if (ready < 0) {
 #ifndef _WIN32
             if (errno == EINTR) continue;
@@ -441,14 +539,17 @@ int main(int argc, char **argv) {
             sock_t s = accept(lis, NULL, NULL);
             if (s != SOCK_BAD) {
                 if (nconn >= MAX_CONN) {
+                    /* ★ここだけは待って送ります（1 行だけなので詰まりません）。
+                     *   断る理由を言わずに切ると、相手は「落ちている」と読みます。 */
                     const char *full = "{\"kind\":\"error\",\"text\":"
                                        "\"つなぎ先がいっぱいです\"}\n"
                                        "{\"kind\":\"end\",\"rc\":1}\n";
-                    (void)send_all(s, full, strlen(full));
+                    (void)send(s, full, (SEND_LEN)strlen(full), 0);
                     sock_close(s);
                 } else {
                     memset(&conns[nconn], 0, sizeof conns[nconn]);
                     conns[nconn].s = s;
+                    set_nonblock(s);
                     nconn++;
                     last = time(NULL);
                 }
@@ -457,48 +558,59 @@ int main(int argc, char **argv) {
 
         for (i = 0; i < nconn;) {
             int drop = 0;
-            if (FD_ISSET(conns[i].s, &rd)) {
+            /* 送れる分を先に送ります（溜まりを減らしてから新しい問い合わせを読む） */
+            if (FD_ISSET(conns[i].s, &wr) && send_some(&conns[i]) != 0) drop = 1;
+            if (!drop && FD_ISSET(conns[i].s, &rd)) {
                 char tmp[CHUNK];
                 int got = (int)recv(conns[i].s, tmp, (SEND_LEN)sizeof tmp, 0);
                 last = time(NULL);
-                if (got <= 0) {
-                    drop = 1;
-                } else {
+                if (got > 0) {
                     buf_mem(&conns[i].in, tmp, (size_t)got);
+                } else if (got == 0) {
+                    drop = 1; /* 向こうが閉じた */
+                } else {
+#ifdef _WIN32
+                    if (WSAGetLastError() != WSAEWOULDBLOCK) drop = 1;
+#else
+                    if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) drop = 1;
+#endif
                 }
-                while (!drop) {
+                /* ★溜まりが多くなったら、そこで読むのをやめます */
+                while (!drop && !conns[i].bye && conns[i].out.n < HIGH_WATER) {
                     char *body = NULL;
-                    size_t blen = 0;
+                    size_t blen = 0, used;
                     const char *why = NULL;
                     int t = take_req(&conns[i], &body, &blen, &why);
                     if (t == 0) break;
                     if (t < 0) {
-                        Buf out;
-                        memset(&out, 0, sizeof out);
-                        buf_str(&out, "{\"kind\":\"error\",\"text\":");
-                        buf_json_str(&out, why ? why : "形が違います");
-                        buf_str(&out, "}\n{\"kind\":\"end\",\"rc\":1}\n");
-                        (void)send_all(conns[i].s, out.p, out.n);
-                        free(out.p);
-                        drop = 1;
+                        buf_str(&conns[i].out, "{\"kind\":\"error\",\"text\":");
+                        buf_json_str(&conns[i].out, why ? why : "形が違います");
+                        buf_str(&conns[i].out, "}\n{\"kind\":\"end\",\"rc\":1}\n");
+                        conns[i].bye = 1; /* 形が違う相手とは、送り終えたら切ります */
                         break;
-                    } else {
-                        Buf out;
-                        size_t used;
-                        int bye;
-                        memset(&out, 0, sizeof out);
-                        bye = run_req(db, body, blen, &out);
-                        if (send_all(conns[i].s, out.p, out.n) != 0) drop = 1;
-                        free(out.p);
-                        used = (size_t)(body - conns[i].in.p) + blen;
-                        buf_drop(&conns[i].in, used);
-                        if (bye) drop = 1;
                     }
+                    conns[i].bye = run_req(db, body, blen, &conns[i].out, max_rows);
+                    used = (size_t)(body - conns[i].in.p) + blen;
+                    buf_drop(&conns[i].in, used);
                 }
+                /* 組んだ分を、送れるだけ送ります */
+                if (!drop && send_some(&conns[i]) != 0) drop = 1;
             }
+            /*
+             * ★読まない相手で溜まりが膨らんだら、その接続を切ります。
+             *   切らないと、1 本のために他の全員が待たされます。
+             */
+            if (!drop && conns[i].out.n > MAX_OUT) {
+                fprintf(stderr, "yuid: 受け取らない接続を切りました（溜まり %lu バイト）\n",
+                        (unsigned long)conns[i].out.n);
+                drop = 1;
+            }
+            /* 終わる／形の誤りのときは、送り終えてから切ります */
+            if (!drop && conns[i].bye && conns[i].out.n == 0) drop = 1;
             if (drop) {
                 sock_close(conns[i].s);
                 free(conns[i].in.p);
+                free(conns[i].out.p);
                 conns[i] = conns[nconn - 1];
                 nconn--;
             } else {
@@ -510,6 +622,7 @@ int main(int argc, char **argv) {
     for (i = 0; i < nconn; i++) {
         sock_close(conns[i].s);
         free(conns[i].in.p);
+        free(conns[i].out.p);
     }
     sock_close(lis);
     if (yui_close(db) != YUI_OK) {

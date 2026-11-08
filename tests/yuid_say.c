@@ -4,6 +4,7 @@
  *   yuid_say <ポート> <問い合わせ> [<問い合わせ> …]   同じ接続で順に投げる
  *   yuid_say <ポート> --file <パス>                   中身を 1 件として投げる
  *   yuid_say <ポート> --raw <パス>                    長さの行ごと そのまま送る
+ *   yuid_say <ポート> --deaf <秒> <問い合わせ>        ★投げたまま読まずに居座る
  *
  * 返ってきたものをそのまま標準出力へ出します。
  *   終了コード 0 = 締めの行（end）まで受け取れた
@@ -20,6 +21,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h> /* nanosleep */
 
 #include "../yui_argv.h" /* ★日本語の問い合わせを渡すため。詳しくは yui_argv.h */
 
@@ -44,6 +46,18 @@ typedef int sock_t;
 #  define sock_close close
 #  define LEN_T      size_t
 #endif
+
+/* ★「読まない相手」を作るために居座ります。デーモンが詰まらないかを見る用 */
+static void nap_s(int sec) {
+#ifdef _WIN32
+    Sleep((DWORD)sec * 1000);
+#else
+    struct timespec ts;
+    ts.tv_sec = sec;
+    ts.tv_nsec = 0;
+    (void)nanosleep(&ts, NULL);
+#endif
+}
 
 static int send_all(sock_t s, const char *p, size_t n) {
     while (n) {
@@ -144,6 +158,21 @@ int main(int argc, char **argv) {
 #endif
     s = socket(AF_INET, SOCK_STREAM, 0);
     if (s == SOCK_BAD) return 1;
+    /*
+     * ★--deaf のときは、受け取る側の緩衝を小さくします。★connect より先に
+     *   やらないと効きません。これが無いと、loopback の緩衝が 1 MB 以上を
+     *   飲み込んでしまい、**デーモンが「待って送る」作りに戻っていても詰まらない**
+     *   ので、検査に検出力がありません（実測で分かりました）。
+     *   ここは試験用の道具なので、小さくして構いません。
+     */
+    if (strcmp(argv[2], "--deaf") == 0) {
+        int small = 2048;
+#ifdef _WIN32
+        (void)setsockopt(s, SOL_SOCKET, SO_RCVBUF, (const char *)&small, sizeof small);
+#else
+        (void)setsockopt(s, SOL_SOCKET, SO_RCVBUF, &small, sizeof small);
+#endif
+    }
     {
 #ifdef _WIN32
         DWORD ms = 10000;
@@ -163,6 +192,31 @@ int main(int argc, char **argv) {
         fprintf(stderr, "繋がりません: 127.0.0.1:%d\n", port);
         sock_close(s);
         return 1;
+    }
+
+    if (strcmp(argv[2], "--deaf") == 0) {
+        /* ★投げるだけ投げて、読まずに居座ります */
+        int sec, j;
+        if (argc < 5) {
+            sock_close(s);
+            return 2;
+        }
+        sec = atoi(argv[3]);
+        for (j = 4; j < argc; j++) {
+            char head[32];
+            size_t len = strlen(argv[j]);
+            snprintf(head, sizeof head, "%lu\n", (unsigned long)len);
+            if (send_all(s, head, strlen(head)) != 0 || send_all(s, argv[j], len) != 0) {
+                rc = 1;
+                break;
+            }
+        }
+        nap_s(sec > 0 ? sec : 1);
+        sock_close(s);
+#ifdef _WIN32
+        WSACleanup();
+#endif
+        return rc;
     }
 
     if (strcmp(argv[2], "--raw") == 0 || strcmp(argv[2], "--file") == 0) {

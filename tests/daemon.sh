@@ -22,6 +22,11 @@ trap 'if [ -f "$PIDFILE" ]; then kill "$(cat "$PIDFILE")" 2> /dev/null; fi; rm -
 ok=0
 ng=0
 
+#
+# ★素の `wait` を使わないこと。素の `wait` は**全部の背景の仕事**を待つので、
+#   長く居座るデーモン（--idle 600）まで待ってしまい、テストが 10 分 止まります
+#   （実際に踏みました）。待つなら PID を指定してください。
+#
 has() {
     case "$2" in
     *"$1"*) ok=$((ok + 1)) ;;
@@ -64,7 +69,7 @@ F="$D/t.yui"
 PORT=0
 i=39210
 while [ "$i" -lt 39230 ]; do
-    "$YUID" "$F" --port "$i" --idle 60 > "$D/log" 2>&1 &
+    "$YUID" "$F" --port "$i" --idle 600 > "$D/log" 2>&1 &
     echo $! > "$PIDFILE"
     # 立ち上がりを待ちます（待ち受けの 1 行が出るまで）
     j=0
@@ -151,15 +156,152 @@ out=$("$SAY" "$PORT" --file "$D/nul" 2>&1)
 has "NUL" "$out" "NUL が入っていたら言うこと"
 has "バイト目" "$out" "NUL の位置を言うこと"
 
+# ----------------------------- 返りの上限（--max-rows）と 読まない相手
+#
+# ★ここが段 1 で「入っていない」と書いていた 2 つです。
+#   上限が無いと、1 回の 探す が 10 万行 返したときに溜まりだけでメモリを食う。
+#   待って送る作りだと、読まないクライアント 1 つで全員 止まる。
+
+# ★別のファイルを使います。同じファイルには 2 本 立てられません
+#   （先に立っている 1 本が錠を持っているので。それが正しい振る舞いです）
+CAPF="$D/cap.yui"
+"$YUI" "$CAPF" '作る (人:甲)
+作る (人:乙)
+作る (人:丙)
+作る (人:丁)
+作る (人:戊)
+作る (案件:ひとつ)' > /dev/null 2>&1
+
+CAPPORT=0
+i=39230
+while [ "$i" -lt 39240 ]; do
+    "$YUID" "$CAPF" --port "$i" --idle 600 --max-rows 3 > "$D/log3" 2>&1 &
+    echo $! > "$D/pid3"
+    j=0
+    while [ "$j" -lt 50 ]; do
+        if grep -q "で待っています" "$D/log3" 2> /dev/null; then break; fi
+        if ! kill -0 "$(cat "$D/pid3")" 2> /dev/null; then break; fi
+        j=$((j + 1))
+        sleep 0.1
+    done
+    if grep -q "で待っています" "$D/log3" 2> /dev/null; then
+        CAPPORT=$i
+        break
+    fi
+    kill "$(cat "$D/pid3")" 2> /dev/null
+    i=$((i + 1))
+done
+
+if [ "$CAPPORT" -eq 0 ]; then
+    ng=$((ng + 1))
+    echo "NG   上限つきのデーモンが立ちませんでした: $(cat "$D/log3")"
+else
+    has "3 行まで" "$(cat "$D/log3")" "立つときに返りの上限を言うこと"
+
+    out=$("$SAY" "$CAPPORT" '一覧 (人:) 名前だけ' 2>&1)
+    has '"cut":true' "$out" "上限で打ち切ったら end に cut を付けること"
+    has "打ち切りました" "$out" "打ち切ったと言うこと"
+    has "新しい N" "$out" "どうすればよいかを言うこと"
+    has '"kind":"end","rc":1' "$out" "打ち切ったら rc が 1 であること"
+    check "上限の行数だけ返すこと" "3" "$(printf '%s\n' "$out" | grep -c '"kind":"node"')"
+
+    # ★上限を超えなければ cut は付かない
+    out=$("$SAY" "$CAPPORT" '一覧 (案件:) 名前だけ' 2>&1)
+    hasnt '"cut":true' "$out" "上限を超えなければ cut を付けないこと"
+
+    kill "$(cat "$D/pid3")" 2> /dev/null
+    wait "$(cat "$D/pid3")" 2> /dev/null
+fi
+
+# ★読まない相手が居ても、他のクライアントが答えてもらえること
+#   （--max-rows 0 で上限を外し、溜まりを作ってから別の接続で聞きます）
+DEAFF="$D/deaf.yui"
+# ★溜まりが 1 MB を超えるだけの返りを作ります。
+#   点の数を増やすより、1 点の本文を長くするほうが速いので、そうしています
+#   （1 万点 作ると、この段だけで 1 分 以上 かかりました）。
+awk 'BEGIN{
+    t = ""; for (j = 0; j < 300; j++) t = t "あ"
+    for (i = 1; i <= 10000; i++) printf "作る (人:ふやす%d {本文: \"%s\"})\n", i, t
+}' > "$D/big.txt"
+"$YUI" "$DEAFF" < "$D/big.txt" > /dev/null 2>&1
+"$YUI" "$DEAFF" '作る (案件:ひとつ)' > /dev/null 2>&1
+
+DEAFPORT=0
+i=39241
+while [ "$i" -lt 39250 ]; do
+    "$YUID" "$DEAFF" --port "$i" --idle 600 --max-rows 0 > "$D/log4" 2>&1 &
+    echo $! > "$D/pid4"
+    j=0
+    while [ "$j" -lt 50 ]; do
+        if grep -q "で待っています" "$D/log4" 2> /dev/null; then break; fi
+        if ! kill -0 "$(cat "$D/pid4")" 2> /dev/null; then break; fi
+        j=$((j + 1))
+        sleep 0.1
+    done
+    if grep -q "で待っています" "$D/log4" 2> /dev/null; then
+        DEAFPORT=$i
+        break
+    fi
+    kill "$(cat "$D/pid4")" 2> /dev/null
+    i=$((i + 1))
+done
+
+if [ "$DEAFPORT" -eq 0 ]; then
+    ng=$((ng + 1))
+    echo "NG   上限なしのデーモンが立ちませんでした: $(cat "$D/log4")"
+else
+    # --- その 1: 溜まる（けれど切るほどではない）相手が居ても、他に答えること
+    #     1200 件ぶん ≒ 1.1 MB。溜まりの関所（1 MB）は超え、切る線（8 MB）は超えない
+    # ★居座る時間（15 秒）は、聞く側の待ち時間（yuid_say の 10 秒）より長くします。
+    #   短いと、待って送る作りに戻しても「相手が去ったあとに答える」で間に合って
+    #   しまい、検査に検出力がありません（実測で分かりました）。
+    #   通るときは 1 秒 ほどで終わるので、長くしても遅くなりません。
+    "$SAY" "$DEAFPORT" --deaf 15 '一覧 (人:) 新しい 1200' > /dev/null 2>&1 &
+    DEAFPID=$!
+    sleep 1
+    out=$("$SAY" "$DEAFPORT" '一覧 (案件:) 名前だけ' 2>&1)
+    check "読まない相手が居ても別の接続に答えること（終了コード）" "0" "$?"
+    has '"kind":"end","rc":0' "$out" "読まない相手が居ても締めの行が返ること"
+    kill "$DEAFPID" 2> /dev/null
+    wait "$DEAFPID" 2> /dev/null
+
+    # --- その 2: 溜まりが切る線を超えたら、その接続を切ること
+    #     1 万件ぶん ≒ 9 MB で、切る線（8 MB）を超えます
+    : > "$D/log4"
+    "$SAY" "$DEAFPORT" --deaf 15 '一覧 ()' > /dev/null 2>&1 &
+    DEAFPID2=$!
+    j=0
+    while [ "$j" -lt 100 ]; do
+        if grep -q "受け取らない接続を切りました" "$D/log4" 2> /dev/null; then break; fi
+        j=$((j + 1))
+        sleep 0.1
+    done
+    has "受け取らない接続を切りました" "$(cat "$D/log4")" \
+        "溜まりが切る線を超えたら、その接続を切ること"
+    # ★切ったあとも、デーモンは生きていて他に答えること
+    out=$("$SAY" "$DEAFPORT" '一覧 (案件:) 名前だけ' 2>&1)
+    has '"kind":"end","rc":0' "$out" "接続を切ったあともデーモンが生きていること"
+    kill "$DEAFPID2" 2> /dev/null
+    wait "$DEAFPID2" 2> /dev/null
+
+    kill "$(cat "$D/pid4")" 2> /dev/null
+    wait "$(cat "$D/pid4")" 2> /dev/null
+fi
+
 # ------------------------------------------------ 2 本 目は立たないこと
-out=$("$YUID" "$F" --port "$PORT" 2>&1)
+#
+# ★--idle 1 を付けます。立たないことを見る段ですが、万一 立ってしまったときに
+#   付けていないと、**永久に走り続けてテストが止まります**（実際に踏みました。
+#   前の段が長引いて 1 本目が空き時間で終わっており、2 本目が立ってしまった）。
+#   前提が崩れたときは、止まるのではなく落ちてほしい。
+out=$("$YUID" "$F" --port "$PORT" --idle 1 2>&1)
 rc=$?
 check "2 本 目のデーモンは立たないこと（終了コード）" "1" "$rc"
 has "使えません" "$out" "2 本 目には口が使えないと言うこと"
 hasnt "で待っています" "$out" "2 本 目は待ち受けを始めないこと"
 
-# ★別のポートでも、同じファイルなら錠で止まること
-out=$("$YUID" "$F" --port $((PORT + 100)) 2>&1)
+# ★別のポートでも、同じファイルなら錠で止まること（同じ理由で --idle 1）
+out=$("$YUID" "$F" --port $((PORT + 100)) --idle 1 2>&1)
 rc=$?
 check "同じファイルなら別のポートでも立たないこと（終了コード）" "1" "$rc"
 has "錠を持っています" "$out" "同じファイルなら錠で止まると言うこと"
