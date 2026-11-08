@@ -74,6 +74,33 @@ static void vec_sort_unique(Vec *a) {
     a->n = w;
 }
 
+/*
+ * 索引の中だけで使う、4 バイトの並び。
+ *
+ * ★索引は「どの文書にその 2〜3 文字の並びが在るか」を文書番号で持ちます。
+ *   数がいちばん多いのがここなので、8 バイトではなく 4 バイトで持ちます
+ *   （本文のある点が何万もあると、索引がメモリの 4 割ほどを占めます。
+ *   README の「何にメモリを使っているか」を見てください）。
+ * ★文書番号は doc = id << 1 | 線なら 1 なので、4 バイトに収まるのは
+ *   id が 2^31-1 までです。1 点に最低でも数百バイト要るので、そこへ届く前に
+ *   メモリが尽きますが、黙って切り捨てると「探しても出てこない」に化けるため、
+ *   点と線を作るところで断ります（MAX_ID）。
+ */
+#define MAX_ID 0x7fffffffu
+
+typedef struct {
+    u32 *v;
+    size_t n, cap;
+} Vec32;
+
+static void vec32_push(Vec32 *a, u32 x) {
+    if (a->n == a->cap) {
+        a->cap = a->cap ? a->cap * 2 : 4;
+        a->v = xrealloc(a->v, a->cap * sizeof(u32));
+    }
+    a->v[a->n++] = x;
+}
+
 typedef struct {
     char *p;
     size_t n, cap;
@@ -282,7 +309,7 @@ typedef struct {
 
 typedef struct {
     u64 key;
-    Vec list;
+    Vec32 list; /* 文書番号の並び。4 バイト（Vec32 の★を見よ） */
 } GramSlot;
 
 struct yui {
@@ -485,7 +512,8 @@ static u64 gram2(u32 a, u32 b) {
 }
 static void gram_add(yui *db, u64 key, u64 doc) {
     GramSlot *g = gram_slot(db, key, 1);
-    if (g->list.n == 0 || g->list.v[g->list.n - 1] != doc) vec_push(&g->list, doc);
+    u32 d = (u32)doc; /* MAX_ID で収まることを確かめてある */
+    if (g->list.n == 0 || g->list.v[g->list.n - 1] != d) vec32_push(&g->list, d);
 }
 static void index_text(yui *db, u64 doc, const char *s) {
     u32 *c;
@@ -537,7 +565,7 @@ static int doc_has(yui *db, u64 doc, const u32 *q, size_t qn) {
 static void search_docs(yui *db, const u32 *q, size_t qn, int use_index, Vec *out) {
     size_t i;
     if (qn >= 2 && use_index) {
-        const Vec *best = NULL;
+        const Vec32 *best = NULL;
         if (qn == 2) {
             GramSlot *g = gram_slot(db, gram2(q[0], q[1]), 0);
             if (!g) return;
@@ -549,8 +577,10 @@ static void search_docs(yui *db, const u32 *q, size_t qn, int use_index, Vec *ou
                 if (!best || g->list.n < best->n) best = &g->list;
             }
         }
-        for (i = 0; i < best->n; i++)
-            if (doc_has(db, best->v[i], q, qn)) vec_push(out, best->v[i]);
+        for (i = 0; i < best->n; i++) {
+            u64 doc = best->v[i];
+            if (doc_has(db, doc, q, qn)) vec_push(out, doc);
+        }
     } else {
         for (i = 1; i <= db->nn; i++)
             if (doc_has(db, DOC_NODE(i), q, qn)) vec_push(out, DOC_NODE(i));
@@ -562,22 +592,48 @@ static void search_docs(yui *db, const u32 *q, size_t qn, int use_index, Vec *ou
 
 /* ---------------------------------------------------------------- メモリへ適用 */
 
+/*
+ * 属性を 1 つの確保にまとめて写す。
+ *
+ * ★古い版は属性ごとにキーと値を別々に取っていました。点 1 つに属性が 8 個
+ *   あれば 16 回の確保で、1 回あたりの管理の負担（malloc が隠れて持つ分）が
+ *   そのまま 16 回 乗ります。点が何万もあると、これがメモリの大きな割合に
+ *   なります（README の「何にメモリを使っているか」を見てください）。
+ * ★ここでは「Attr の並び ＋ 文字列の中身」を 1 つの塊として取り、
+ *   キーと値はその中を指します。確保は点 1 つに 1 回です。
+ * ★なので attrs_free が free するのは塊の先頭だけです。
+ *   キーや値を個別に free してはいけません（塊の途中を指しています）。
+ */
 static Attr *attrs_dup(const Attr *a, size_t n) {
-    Attr *r = xmalloc(n * sizeof(Attr));
-    size_t i;
+    size_t i, need = n * sizeof(Attr), len;
+    char *p;
+    Attr *r;
+    if (!n) return NULL;
+    for (i = 0; i < n; i++) {
+        need += strlen(a[i].key) + 1;
+        if (a[i].v.type == V_STR) need += strlen(a[i].v.s) + 1;
+    }
+    r = xmalloc(need);
+    /* ★文字列は Attr の並びの直後に置きます。文字の列なので、
+     *   並びの境目で詰め物（alignment）は要りません。 */
+    p = (char *)r + n * sizeof(Attr);
     for (i = 0; i < n; i++) {
         r[i] = a[i];
-        r[i].key = xstrdup(a[i].key);
-        if (a[i].v.type == V_STR) r[i].v.s = xstrdup(a[i].v.s);
+        len = strlen(a[i].key) + 1;
+        memcpy(p, a[i].key, len);
+        r[i].key = p;
+        p += len;
+        if (a[i].v.type == V_STR) {
+            len = strlen(a[i].v.s) + 1;
+            memcpy(p, a[i].v.s, len);
+            r[i].v.s = p;
+            p += len;
+        }
     }
     return r;
 }
 static void attrs_free(Attr *a, size_t n) {
-    size_t i;
-    for (i = 0; i < n; i++) {
-        free(a[i].key);
-        if (a[i].v.type == V_STR) free(a[i].v.s);
-    }
+    (void)n; /* 塊 1 つなので、数は要りません */
     free(a);
 }
 static void node_key(Str *k, const char *label, const char *name) {
@@ -604,6 +660,13 @@ static int apply_node(yui *db, u64 id, const char *label, const char *name, cons
     Node *x;
     if (id == db->nn + 1) {
         Str k = {0};
+        /* ★索引が文書番号を 4 バイトで持つので、ここが上限です（Vec32 の★）。
+         *   届く前にメモリが尽きますが、黙って切り捨てると
+         *   「探しても出てこない」に化けるので断ります。 */
+        if (id > MAX_ID) {
+            set_err(db, "点が多すぎます（%llu 件まで）", (unsigned long long)MAX_ID);
+            return -1;
+        }
         if (db->nn == db->ncap) {
             db->ncap = db->ncap ? db->ncap * 2 : 64;
             db->nodes = xrealloc(db->nodes, db->ncap * sizeof(Node));
@@ -639,6 +702,10 @@ static int apply_edge(yui *db, u64 id, u64 from, u64 to, const char *type, const
     if (to < 1 || to > db->nn || !db->nodes[to - 1].live) return -1;
     if (id == db->ne + 1) {
         Str k = {0};
+        if (id > MAX_ID) {
+            set_err(db, "線が多すぎます（%llu 本まで）", (unsigned long long)MAX_ID);
+            return -1;
+        }
         if (db->ne == db->ecap) {
             db->ecap = db->ecap ? db->ecap * 2 : 64;
             db->edges = xrealloc(db->edges, db->ecap * sizeof(Edge));
@@ -1890,7 +1957,25 @@ static int cmd_link(P *p) {
     }
     if (put_edge(db, ia, ib, e.type, e.attrs.a, e.attrs.n, &ie, &st) != 0) return -1;
     emit_doc(db, DOC_EDGE(ie), &SHOW_ALL);
-    emit(db, YUI_SUMMARY, status_word(st));
+    /*
+     * ★端の点を作ったときは、そう言います。
+     *   結ぶ は点が無ければ作る言葉ですが（README に書いてあります）、
+     *   出力には出ていませんでした。流し込みで名前を打ち間違えると、
+     *   属性の無い点が静かに増えます。実際に 2 人の利用者が踏んでいます
+     *   （「リンク先の無い 11 件が空の点として増えていた」
+     *     「点の数が SQLite より 2 件 多い」）。
+     *   数えれば分かるものを、数えなくても分かるようにします。
+     */
+    {
+        int made = (sa == 1) + (sb == 1);
+        if (!made) {
+            emit(db, YUI_SUMMARY, status_word(st));
+        } else {
+            char msg[80];
+            snprintf(msg, sizeof msg, "%s（端の点も %d つ 作りました）", status_word(st), made);
+            emit(db, YUI_SUMMARY, msg);
+        }
+    }
     return 0;
 }
 
@@ -2164,7 +2249,10 @@ static int cmd_walk(P *p) {
     EdgePat e;
     Vec starts = {0}, queue = {0};
     Str o = {0};
-    Top top;
+    /* ★{0} で初期化します。使うのは lim があるときだけですが、
+     *   -O2 の gcc は「使われるかもしれない」と見ます（実際には通りません）。
+     *   警告を消すためだけでなく、読む人が追わなくて済むようにもなります。 */
+    Top top = {0};
     size_t s, count = 0;
     long maxd, lim;
     Show sh;
