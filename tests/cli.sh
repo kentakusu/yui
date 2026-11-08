@@ -30,6 +30,17 @@ check() {
         echo "     実際: $3"
     fi
 }
+# 文字列が含まれていないこと
+hasnt() {
+    case "$2" in
+    *"$1"*)
+        ng=$((ng + 1))
+        echo "NG   $3"
+        echo "     「$1」が出ています。出たのは: $2"
+        ;;
+    *) ok=$((ok + 1)) ;;
+    esac
+}
 # 文字列が含まれているか
 has() {
     case "$2" in
@@ -217,6 +228,39 @@ else
     else
         ok=$((ok + 1))
     fi
+fi
+
+# ------------------------------------------------- 端末として開いたとき
+
+# ★isatty(0) が真のときだけ通る道です（呼び出しの合図を出す・行番号を出さない）。
+#   ふつうの流し込みでは通らないので、疑似端末を割り当てて測ります。
+#   script の書き方は GNU と BSD（macOS）で違うので、両方 試します。
+PTY=""
+if (script -q -c "echo ok" /dev/null) > /dev/null 2>&1; then
+    PTY=gnu
+elif (script -q /dev/null echo ok) > /dev/null 2>&1; then
+    PTY=bsd
+fi
+run_pty() { # $1=ファイル、標準入力から命令を流す
+    if [ "$PTY" = gnu ]; then
+        script -q -c "$YUI $1" /dev/null 2>&1
+    else
+        script -q /dev/null "$YUI" "$1" 2>&1
+    fi
+}
+if [ -z "$PTY" ]; then
+    echo "-- 見ていません: 端末として開いたときの道（script が無いので疑似端末を作れません）"
+else
+    out=$(printf '一覧 ()
+これは誤り
+終わる
+' | run_pty "$D/pty.yui")
+    has "yui> " "$out" "端末では呼び出しの合図を出すこと"
+    has "手引き" "$out" "端末では使い方の 1 行を出すこと"
+    # ★端末では行番号を出しません（「1 行目」と言われても手がかりにならないので）
+    hasnt "行目" "$out" "端末では行番号を出さないこと"
+    has "0 件" "$out" "端末でも結果を出すこと"
+    has "知らない言葉です" "$out" "端末でも失敗の理由を出すこと"
 fi
 
 # ---------------------------------------------------------------- 締め

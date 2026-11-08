@@ -2395,7 +2395,16 @@ static int cmd_list(P *p) {
     long lim;
     Show sh;
     memset(&n, 0, sizeof n);
-    if (peek(p) == '(' && parse_node(p, &n, 0) != 0) return -1;
+    /*
+     * ★括弧を省けません。
+     *   古い版は省けて、そのとき 0 件 を返していました。ゼロで埋めた形が
+     *   どの点にも当たらないためで、意図した振る舞いではありません。
+     *   「データが 0 件」と「書き方を間違えた」が同じ見た目になるので、
+     *   断ります。すべてを出したいなら 一覧 () と書けます。
+     *   辿る と 見る も、点の形が無ければ断ります（同じ扱いにそろえました）。
+     */
+    if (peek(p) != '(') return perr(p, "一覧 には点の形が必要です（すべてなら 一覧 ()）");
+    if (parse_node(p, &n, 0) != 0) return -1;
     if (parse_mods(p, &lim, &sh) != 0) return -1;
     collect_nodes(db, &n, &v);
     /* ★collect_nodes は id の昇順で返します（最後に vec_sort_unique を通るため）。
