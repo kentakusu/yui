@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #ifdef _WIN32
 #  include "yui_win.h" /* Windows 用の受け皿。POSIX の低水準 I/O を置き換えます */
 #else
@@ -323,6 +324,7 @@ typedef struct {
 struct yui {
     int fd;
     char *path;
+    char *lockpath; /* 土台をまたぐ錠。使っていなければ NULL */
     u64 size;
     Node *nodes;
     size_t nn, ncap;
@@ -3016,24 +3018,197 @@ fail:
     return -1;
 }
 
-int yui_open(const char *path, yui **out) {
+/* --------------------------------------------- 土台をまたいで効く錠 */
+
+/*
+ * flock（POSIX）と LockFileEx（Windows）は互いを排除せず、wasm の flock は
+ * 何もしません。だから土台をまたいで 1 つのファイルを使うときは、flock だけでは
+ * 足りません。ここでは「<パス>.錠 を O_EXCL で作る」形を使います。
+ * O_EXCL は土台をまたいでも原子的で、同時に試しても 1 つしか成功しません。
+ *
+ * ★代わりに、持ち主が落ちても外れません。だから結は「持ち主を名乗って断る」
+ *   ところまでをやり、壊すかどうかは呼び出した側が決めます。
+ *   理由と設計は docs/デーモンの構想.md の「段 0 の決着」に書いてあります。
+ */
+#define LOCK_SUFFIX ".錠"
+#define LOCK_READ_MAX 1024 /* 錠を読むときの上限。これより長い分は見ません */
+
+static char *lock_path_of(const char *path) {
+    size_t n = strlen(path);
+    char *p = xmalloc(n + sizeof LOCK_SUFFIX);
+    memcpy(p, path, n);
+    memcpy(p + n, LOCK_SUFFIX, sizeof LOCK_SUFFIX);
+    return p;
+}
+
+/*
+ * 機械の名前。取れなければ "?" にします。
+ * ★wasm では意味のある名前が出ません。そのための名乗りです。
+ */
+static void lock_machine(char *buf, size_t n) {
+    buf[0] = 0;
+#ifdef _WIN32
+    {
+        const char *e = getenv("COMPUTERNAME");
+        if (e && *e) {
+            size_t k = strlen(e);
+            if (k >= n) k = n - 1;
+            memcpy(buf, e, k);
+            buf[k] = 0;
+        }
+    }
+#elif defined(__EMSCRIPTEN__)
+    /*
+     * ★wasm では機械の名前が取れません（取れても仮想の値です）。
+     *   当てにならない値を書くより、当てにならないと書きます。
+     *   どのプログラムかは name（呼び出し側の名乗り）で見てください。
+     */
+    if (n > sizeof "wasm") memcpy(buf, "wasm", sizeof "wasm");
+#else
+    if (gethostname(buf, n) != 0) buf[0] = 0;
+    buf[n - 1] = 0;
+#endif
+    if (!buf[0]) {
+        buf[0] = '?';
+        buf[1] = 0;
+    }
+}
+
+/*
+ * 名乗りから制御文字を抜きます。
+ * ★改行が入ると錠の形が壊れるので、必ずここを通します。
+ */
+static void lock_clean(const char *src, char *buf, size_t n) {
+    size_t i = 0;
+    if (!src) src = "";
+    for (; src[i] && i + 1 < n; i++) {
+        unsigned char c = (unsigned char)src[i];
+        buf[i] = (c < 0x20 || c == 0x7f) ? ' ' : src[i];
+    }
+    buf[i] = 0;
+    if (!buf[0]) {
+        buf[0] = '-';
+        buf[1] = 0;
+    }
+}
+
+/* 壊して取ったあと「自分のものか」を読み返して確かめるための印 */
+static u64 lock_tag(void) {
+    u64 t = (u64)time(NULL);
+    u64 p = (u64)(unsigned long)getpid();
+    u64 a = (u64)(uintptr_t)&t;
+    return (t << 20) ^ (p << 7) ^ a ^ (a >> 19);
+}
+
+/* 錠の中身。★キーは ASCII です（機械で読む側のため） */
+static void lock_body(Str *s, const char *name, u64 tag) {
+    char mach[256], nm[256], line[600], when[64];
+    time_t now = time(NULL);
+    struct tm *lt = localtime(&now);
+    lock_machine(mach, sizeof mach);
+    lock_clean(name, nm, sizeof nm);
+    str_add(s, "yui-lock 1\n");
+    snprintf(line, sizeof line, "name=%s\n", nm);
+    str_add(s, line);
+    snprintf(line, sizeof line, "machine=%s\n", mach);
+    str_add(s, line);
+    snprintf(line, sizeof line, "pid=%lu\n", (unsigned long)getpid());
+    str_add(s, line);
+    snprintf(line, sizeof line, "since=%lld\n", (long long)now);
+    str_add(s, line);
+    if (lt && strftime(when, sizeof when, "%Y-%m-%dT%H:%M:%S%z", lt) > 0) {
+        snprintf(line, sizeof line, "since-local=%s\n", when);
+        str_add(s, line);
+    }
+    snprintf(line, sizeof line, "tag=%016llx\n", (unsigned long long)tag);
+    str_add(s, line);
+}
+
+/* 0 = 取れた、1 = 塞がれていた、-1 = 作れなかった */
+static int lock_take(yui *db, const char *lpath, const char *name, u64 tag) {
+    Str s;
+    int fd, rc = 0;
+    memset(&s, 0, sizeof s);
+    fd = open(lpath, O_WRONLY | O_CREAT | O_EXCL, 0644);
+    if (fd < 0) {
+        if (errno == EEXIST) return 1;
+        set_err(db, "錠を作れません: %s: %s", lpath, strerror(errno));
+        return -1;
+    }
+    lock_body(&s, name, tag);
+    if (write_all(fd, s.p, s.n) != 0) rc = -1;
+    if (rc == 0 && fsync(fd) != 0) rc = -1;
+    if (close(fd) != 0) rc = -1;
+    if (rc != 0) {
+        set_err(db, "錠に書けません: %s: %s", lpath, strerror(errno));
+        remove(lpath); /* 中身の無い錠を残さない */
+    }
+    free(s.p);
+    return rc;
+}
+
+#ifdef YUI_SELFCHECK
+/*
+ * ★試験だけの差し込み口。-DYUI_SELFCHECK はテストのビルドにしか付きません。
+ *   錠を取ったあとに別のところが先に取っていた状況を作って、
+ *   「読み返して確かめる」が効いているかを見るために使います。
+ *   1 プロセスからは本物の取り合いを起こせないので、これが無いと
+ *   読み返しの確かめは誰にも守られません。
+ */
+void (*yui_selfcheck_took_lock)(const char *lpath) = NULL;
+#endif
+
+/* 0 = 読めた、1 = 錠が無い、-1 = 読めなかった */
+static int lock_slurp(const char *lpath, char *buf, size_t bufn) {
+    int fd;
+    ssize_t got;
+    size_t cap = bufn < LOCK_READ_MAX ? bufn : LOCK_READ_MAX;
+    buf[0] = 0;
+    if (cap < 2) return -1;
+    fd = open(lpath, O_RDONLY, 0644);
+    if (fd < 0) return errno == ENOENT ? 1 : -1;
+    got = read(fd, buf, cap - 1);
+    close(fd);
+    if (got < 0) {
+        buf[0] = 0;
+        return -1;
+    }
+    buf[got] = 0;
+    return 0;
+}
+
+int yui_lock_owner(const char *path, char *buf, size_t bufn) {
+    char *lpath;
+    int rc;
+    if (!buf || bufn < 2) return YUI_ERROR;
+    buf[0] = 0;
+    if (!path || !*path) return YUI_ERROR;
+    lpath = lock_path_of(path);
+    rc = lock_slurp(lpath, buf, bufn);
+    free(lpath);
+    if (rc < 0) return YUI_ERROR;
+    return YUI_OK; /* 錠が無ければ buf は空のまま */
+}
+
+/* 器を作るところだけ。開くのは open_body です */
+static yui *db_new(yui **out) {
     yui *db = xmalloc(sizeof *db);
     memset(db, 0, sizeof *db);
     db->fd = -1;
     *out = db;
     crc_init(db);
-    if (!path || !*path) {
-        set_err(db, "ファイル名がありません");
-        return YUI_ERROR;
-    }
-    db->path = xstrdup(path);
-    db->fd = open(path, O_RDWR | O_CREAT, 0644);
+    return db;
+}
+
+/* db->path を開いて flock して読み込みます */
+static int open_body(yui *db) {
+    db->fd = open(db->path, O_RDWR | O_CREAT, 0644);
     if (db->fd < 0) {
-        set_err(db, "開けません: %s: %s", path, strerror(errno));
+        set_err(db, "開けません: %s: %s", db->path, strerror(errno));
         return YUI_ERROR;
     }
     if (flock(db->fd, LOCK_EX | LOCK_NB) != 0) {
-        set_err(db, "別のところで開かれています: %s", path);
+        set_err(db, "別のところで開かれています: %s", db->path);
         goto fail;
     }
     if (load_file(db) != 0) goto fail;
@@ -3042,6 +3217,74 @@ fail:
     close(db->fd);
     db->fd = -1;
     return YUI_ERROR;
+}
+
+int yui_open_locked(const char *path, const char *name, int flags, yui **out) {
+    yui *db = db_new(out);
+    char *lpath;
+    char got[LOCK_READ_MAX];
+    char want[32];
+    u64 tag;
+    int rc;
+
+    if (!path || !*path) {
+        set_err(db, "ファイル名がありません");
+        return YUI_ERROR;
+    }
+    db->path = xstrdup(path);
+
+    /*
+     * ★錠を flock より先に当てます。順番が逆だと、同じ土台どうしの衝突が
+     *   flock に先に弾かれて、「持ち主を名乗る」が働きません。
+     *   錠を先に取れば、どの土台から来た相手でも持ち主を名乗って断れます。
+     */
+    lpath = lock_path_of(path);
+    tag = lock_tag();
+    rc = lock_take(db, lpath, name, tag);
+
+    if (rc == 1 && (flags & YUI_LOCK_BREAK)) {
+        /*
+         * ★消してから作り直すまでを、この 1 回の呼び出しの中でやります。
+         *   別々の呼び出しにすると、間に他が入れます。
+         *   それでも窓は無くせないので、下で読み返して確かめます。
+         */
+        remove(lpath);
+        rc = lock_take(db, lpath, name, tag);
+        if (rc == 0) {
+#ifdef YUI_SELFCHECK
+            if (yui_selfcheck_took_lock) yui_selfcheck_took_lock(lpath);
+#endif
+            snprintf(want, sizeof want, "tag=%016llx", (unsigned long long)tag);
+            if (lock_slurp(lpath, got, sizeof got) != 0 || !strstr(got, want))
+                rc = 2; /* 壊して取り直す間に、別のところが先に取った */
+        }
+    }
+
+    if (rc != 0) {
+        if (rc == 1) {
+            got[0] = 0;
+            lock_slurp(lpath, got, sizeof got);
+            set_err(db, "別のところが錠を持っています: %s\n%s", lpath, got);
+        } else if (rc == 2) {
+            set_err(db, "錠を取り合って負けました: %s", lpath);
+        }
+        free(lpath);
+        return YUI_ERROR;
+    }
+
+    /* ★ここから先で失敗しても、yui_close が錠を外します */
+    db->lockpath = lpath;
+    return open_body(db);
+}
+
+int yui_open(const char *path, yui **out) {
+    yui *db = db_new(out);
+    if (!path || !*path) {
+        set_err(db, "ファイル名がありません");
+        return YUI_ERROR;
+    }
+    db->path = xstrdup(path);
+    return open_body(db);
 }
 
 const char *yui_errmsg(yui *db) {
@@ -3056,6 +3299,12 @@ int yui_close(yui *db) {
     if (db->fd >= 0) {
         if (fsync(db->fd) != 0) rc = YUI_ERROR;
         if (close(db->fd) != 0) rc = YUI_ERROR;
+    }
+    /* ★錠は閉じるときに必ず外します（落ちたときは残ります。そのための名乗りです） */
+    if (db->lockpath) {
+        remove(db->lockpath);
+        free(db->lockpath);
+        db->lockpath = NULL;
     }
     free_state(db);
     free(db->err);

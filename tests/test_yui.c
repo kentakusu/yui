@@ -40,6 +40,7 @@
 #define TMP     "yui_test_tmp.yui"
 #define TMPFRAG "yui_test_tmp.yui.断片"
 #define TMPPACK "yui_test_tmp.yui.詰" /* 詰め直す の作業用。残っていたら失敗 */
+#define TMPLOCK "yui_test_tmp.yui.錠" /* 土台をまたぐ錠 */
 #define MAXROW  256
 
 static int ng = 0;      /* 失敗した数 */
@@ -148,6 +149,14 @@ static void clean(void) {
     remove_file(TMP);
     remove_file(TMPFRAG);
     remove_file(TMPPACK);
+    remove_file(TMPLOCK);
+}
+
+static int file_exists(const char *path) {
+    FILE *f = open_file(path, "rb");
+    if (!f) return 0;
+    fclose(f);
+    return 1;
 }
 
 /* NUL を含むファイルの中を探す。strstr は最初の NUL で止まるので使えません */
@@ -424,8 +433,10 @@ static void direct_tests(void) {
          * この土台では排他を確かめられません。ネイティブと wasm が同じ
          * ファイルを同時に書くと、警告も出ないまま壊れます。 */
         skip("同じファイルを 2 つ開けないこと",
-             rc == YUI_OK ? "wasm は錠を掛けないので開けてしまいます（既知の穴）"
-                          : "wasm なのに断りました。錠が入ったのかもしれません");
+             rc == YUI_OK
+                 ? "wasm の flock は何もしないので開けてしまいます。"
+                   "塞ぎたいときは yui_open_locked を使ってください（下の錠の検査で見ています）"
+                 : "wasm なのに断りました。flock が入ったのかもしれません");
 #else
         ok("同じファイルを 2 つ開けないこと", rc == YUI_ERROR,
            rc == YUI_OK ? "開けてしまいました" : NULL);
@@ -743,6 +754,147 @@ static void direct_tests(void) {
 
 /* ------------------------------------------------------------------ */
 
+#ifdef YUI_SELFCHECK
+/* 錠を取った直後に、別のところが先に取っていた状況を作ります（本体の差し込み口） */
+extern void (*yui_selfcheck_took_lock)(const char *lpath);
+static void steal_lock(const char *lpath) {
+    FILE *f = open_file(lpath, "wb");
+    if (!f) return;
+    fputs("yui-lock 1\nname=先に取った誰か\ntag=0000000000000000\n", f);
+    fclose(f);
+}
+#endif
+
+/*
+ * 土台をまたいで効く錠（yui_open_locked / yui_lock_owner）。
+ * ★ここで見ているのは「同じ土台の中で、錠の決まりどおりに動くか」です。
+ *   土台をまたいで本当に排除できるかは、1 つのプロセスからは確かめられません
+ *   （別の土台のプロセスを起こす必要があります）。その実測は
+ *   docs/デーモンの構想.md の「測った土台の性質」にあります。
+ */
+static void lock_tests(void) {
+    yui *db, *db2;
+    char owner[1024];
+    char *body;
+    long len;
+    FILE *f;
+
+    /* 1. 錠を使って開くと錠ができ、中身に名乗りが入る */
+    make_small();
+    if (yui_open_locked(TMP, "試験 1.0", 0, &db) == YUI_OK) {
+        body = read_file(TMPLOCK, &len);
+        ok("錠を使って開くと 錠のファイルができること", body != NULL, NULL);
+        if (body) {
+            ok("錠の 1 行目が yui-lock であること", starts(body, "yui-lock 1\n"), body);
+            ok("錠に名乗りが入ること", strstr(body, "name=試験 1.0\n") != NULL, body);
+            ok("錠に pid が入ること", strstr(body, "\npid=") != NULL, body);
+            ok("錠に since が入ること", strstr(body, "\nsince=") != NULL, body);
+            free(body);
+        }
+
+        /* 2. 開かずに持ち主を読める */
+        owner[0] = 0;
+        ok("持ち主を開かずに読めること",
+           yui_lock_owner(TMP, owner, sizeof owner) == YUI_OK &&
+               strstr(owner, "name=試験 1.0\n") != NULL,
+           owner);
+
+        /* 3. 2 つめは断られ、持ち主を名乗る
+         *    ★錠を flock より先に当てているので、同じ土台どうしでも
+         *      「誰が持っているか」が出ます。順番が逆だと出ません。 */
+        if (yui_open_locked(TMP, "試験 2.0", 0, &db2) == YUI_ERROR) {
+            ok("断る理由が錠のことであること",
+               starts(yui_errmsg(db2), "別のところが錠を持っています"), yui_errmsg(db2));
+            ok("断る理由に持ち主の名乗りが入ること",
+               strstr(yui_errmsg(db2), "name=試験 1.0") != NULL, yui_errmsg(db2));
+        } else {
+            ok("錠が塞がれていたら断ること", 0, "開けてしまいました");
+        }
+        yui_close(db2);
+        /* ★断られた側が閉じても、持ち主の錠を消してはいけません */
+        ok("断られた側が閉じても錠が残ること", file_exists(TMPLOCK), NULL);
+
+        yui_close(db);
+    } else {
+        ok("下ごしらえ（錠を使って開く）", 0, yui_errmsg(db));
+        yui_close(db);
+    }
+    ok("閉じると錠が消えること", !file_exists(TMPLOCK), NULL);
+
+    /* 4. 錠が無いのは失敗ではない。持ち主が空で返る */
+    owner[0] = 'x';
+    owner[1] = 0;
+    ok("錠が無ければ持ち主は空で YUI_OK が返ること",
+       yui_lock_owner(TMP, owner, sizeof owner) == YUI_OK && owner[0] == 0, owner);
+
+    /* 5. 落ちた持ち主が残した錠（残骸）は、自動では壊さない */
+    f = open_file(TMPLOCK, "wb");
+    if (f) {
+        fputs("yui-lock 1\nname=落ちた誰か\nmachine=どこか\npid=999999\nsince=1\n", f);
+        fclose(f);
+    }
+    ok("残骸があると断ること", yui_open_locked(TMP, "試験 3.0", 0, &db) == YUI_ERROR, NULL);
+    ok("断る理由に残骸の持ち主が出ること", strstr(yui_errmsg(db), "name=落ちた誰か") != NULL,
+       yui_errmsg(db));
+    yui_close(db);
+    ok("自動では残骸を壊さないこと", file_exists(TMPLOCK), NULL);
+
+    /* 6. 壊して取る（1 回の呼び出しで） */
+    if (yui_open_locked(TMP, "試験 4.0", YUI_LOCK_BREAK, &db) == YUI_OK) {
+        owner[0] = 0;
+        yui_lock_owner(TMP, owner, sizeof owner);
+        ok("壊して取ると錠が自分のものになること", strstr(owner, "name=試験 4.0\n") != NULL,
+           owner);
+        ok("壊して取ると前の持ち主が消えること", strstr(owner, "落ちた誰か") == NULL, owner);
+    } else {
+        ok("壊して取れること", 0, yui_errmsg(db));
+    }
+    yui_close(db);
+
+    /* 7. 名乗りの制御文字で錠の形が壊れないこと */
+    if (yui_open_locked(TMP, "改行\nを入れた", 0, &db) == YUI_OK) {
+        owner[0] = 0;
+        yui_lock_owner(TMP, owner, sizeof owner);
+        ok("名乗りの改行が空白になること", strstr(owner, "name=改行 を入れた\n") != NULL,
+           owner);
+    } else {
+        ok("下ごしらえ（改行入りの名乗りで開く）", 0, yui_errmsg(db));
+    }
+    yui_close(db);
+
+    /* 8. 壊して取り直す隙に、別のところが先に取ったとき
+     *    ★この窓は無くせないので、取ったあと読み返して自分のものか確かめます。
+     *      1 プロセスからは本物の取り合いを起こせないため、本体の
+     *      差し込み口（-DYUI_SELFCHECK のときだけ在る）で状況を作ります。 */
+#ifdef YUI_SELFCHECK
+    f = open_file(TMPLOCK, "wb");
+    if (f) {
+        fputs("yui-lock 1\nname=落ちた誰か\n", f);
+        fclose(f);
+    }
+    yui_selfcheck_took_lock = steal_lock;
+    ok("取り合いに負けたら断ること",
+       yui_open_locked(TMP, "試験 5.0", YUI_LOCK_BREAK, &db) == YUI_ERROR, NULL);
+    ok("負けた理由がそう言えること", starts(yui_errmsg(db), "錠を取り合って負けました"),
+       yui_errmsg(db));
+    yui_selfcheck_took_lock = NULL;
+    yui_close(db);
+    remove_file(TMPLOCK);
+#else
+    skip("取り合いに負けたときに断ること",
+         "状況を作る差し込み口が -DYUI_SELFCHECK のビルドにしかありません");
+#endif
+
+    /* 9. ★既定 off。ふつうに開いたら錠を作らない */
+    if (yui_open(TMP, &db) == YUI_OK)
+        ok("ふつうに開くと錠を作らないこと", !file_exists(TMPLOCK), NULL);
+    else
+        ok("下ごしらえ（ふつうに開く）", 0, yui_errmsg(db));
+    yui_close(db);
+
+    clean();
+}
+
 int main(int argc, char **argv) {
     int i, record = 0, cases = 0;
 
@@ -761,6 +913,7 @@ int main(int argc, char **argv) {
     if (record) return ng ? 1 : 0;
 
     direct_tests();
+    lock_tests();
 
     if (ng == 0) {
         printf("ok  ケース %d 本 / 確かめた %d 件 / 見ていない %d 件 — 失敗 0 件\n",

@@ -36,6 +36,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <io.h>
+#include <process.h> /* _getpid */
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
@@ -186,6 +187,7 @@ static int yui_win_flock(int fd, int op) {
 #define lseek     _lseeki64
 #define close     _close
 #define isatty    _isatty
+#define getpid    _getpid
 /*
  * fstat と struct stat は MSVC の <sys/stat.h> がそのまま用意してくれるので、
  * ここでは置き換えません（_fstat に替えると struct の型が合わず警告になります）。

@@ -15,6 +15,8 @@
 #ifndef YUI_H
 #define YUI_H
 
+#include <stddef.h> /* size_t */
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -50,6 +52,59 @@ typedef int (*yui_cb)(void *ctx, int kind, const char *text);
  * yui_close() してください。
  */
 int yui_open(const char *path, yui **db);
+
+/* yui_open_locked の旗 */
+#define YUI_LOCK_BREAK 1 /* 塞がれていたら壊して取る */
+
+/*
+ * yui_open と同じですが、`<パス>.錠` も取ります。
+ *
+ * ★何のためか: flock（POSIX）と LockFileEx（Windows）は互いを排除せず、
+ *   wasm の flock は何もしません。**同じファイルを別の土台から開くと、
+ *   どちらも「自分が持ち主だ」と思ったまま書けます。**この関数は
+ *   `<パス>.錠` を O_EXCL で作ることで、土台をまたいで排除します。
+ *
+ * ★既定が off なのは、錠を既定にすると「開けないことがある」が増えるからです。
+ *   yui_open の振る舞いは変わりません。土台をまたいで使うときだけこちらを呼んでください。
+ *
+ * name は名乗りです（例 "my-app 1.2.3"）。機械名と pid だけでは
+ * 同じ機械の中の別のプログラムと区別できないので、**必ず渡してください**。
+ * 制御文字は空白に置き換えます。NULL や空なら "-" になります。
+ *
+ * flags に YUI_LOCK_BREAK を入れると、塞がれていたときに壊して取ります。
+ * 入れなければ、持ち主を名乗って YUI_ERROR で返ります（yui_errmsg() に錠の中身が入ります）。
+ *
+ * ★持ち主が落ちても錠は外れません（flock は外れます）。
+ *   「壊してよいか」は結には判断できません——pid の生死は同じ土台の中でしか見られず、
+ *   「同じ機械か」も判定できません。**判断は呼び出した側がしてください。**
+ *   先に yui_lock_owner() で持ち主を読み、自分が落ちた残りだと分かったときだけ
+ *   YUI_LOCK_BREAK を付けてください。
+ *
+ * ★錠は yui_close() で外れます。異常終了したときは残ります。
+ * ★`詰め直す` の入れ替えの一瞬も、この錠は外れません（flock は外れます）。
+ *   ただし守れるのは、**同じファイルを使う全員がこの関数で開いているとき**だけです。
+ *
+ * 失敗しても *db には値が入るので、yui_errmsg() を読んでから yui_close() してください。
+ */
+int yui_open_locked(const char *path, const char *name, int flags, yui **db);
+
+/*
+ * `<パス>.錠` の中身を、ファイルを開かずに読みます。
+ * 錠が無ければ buf は空文字列になり YUI_OK を返します（＝「無い」は失敗ではありません）。
+ * 読めなかったときだけ YUI_ERROR です。
+ *
+ * 中身は 1 行 1 項目で、キーは ASCII です。
+ *   yui-lock 1
+ *   name=...          呼び出し側が渡した名乗り
+ *   machine=...       機械の名前（wasm では意味のある値になりません）
+ *   pid=...           ★その機械の中でしか意味がありません
+ *   since=...         取った時刻（エポック秒）。★機械をまたいで比べるならこちらを使ってください
+ *   since-local=...   取った時刻（持ち主の地方時）
+ *   tag=...           結が内部で使う印
+ *
+ * ★項目は増えることがあります。知らないキーは読み飛ばしてください。
+ */
+int yui_lock_owner(const char *path, char *buf, size_t bufn);
 
 /*
  * 問い合わせを実行します。cb は NULL でも構いません。
