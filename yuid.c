@@ -73,11 +73,16 @@ typedef int sock_t;
 /*
  * ★読まないクライアントへの備え。待たずに送る作りにしても、相手が読まなければ
  *   こちらの溜まりが増え続けます。だから 2 段で止めます。
- *   HIGH_WATER を超えたら、その接続の新しい問い合わせを受け付けません。
- *   MAX_OUT を超えたら、その接続を切ります（他のクライアントを守るため）。
+ *   関所（high water）を超えたら、その接続の新しい問い合わせを受け付けません。
+ *   切る線（max out）を超えたら、その接続を切ります（他のクライアントを守るため）。
+ *
+ * ★切る線を --max-out で変えられるようにしてあります。テストのためです。
+ *   既定の 8 MB のままだと、**OS の緩衝がそれだけ飲み込んでしまう土台**があり
+ *   （macOS で実測）、溜まりが線を超えないので検査が噛みません。
+ *   小さくすれば、緩衝の大きさに関係なく確かめられます。
  */
-#define HIGH_WATER (1UL * 1024UL * 1024UL)
-#define MAX_OUT    (8UL * 1024UL * 1024UL)
+#define DEFAULT_HIGH_WATER (1UL * 1024UL * 1024UL)
+#define DEFAULT_MAX_OUT    (8UL * 1024UL * 1024UL)
 
 /* ★Ctrl-C で落ちると錠が残ります。合図を受けて、閉じてから終わります */
 static volatile sig_atomic_t stop_now = 0;
@@ -373,8 +378,9 @@ static void usage(const char *me) {
             "  --port      既定 %d\n"
             "  --idle      誰も繋いでいない状態がこの秒数 続いたら終わります（既定 0＝終わらない）\n"
             "  --max-rows  1 回の問い合わせで返す行の上限（既定 %d・0 で外す）\n"
-            "              ★超えたら打ち切り、end に cut を付けて言います\n",
-            me, DEFAULT_PORT, DEFAULT_MAX_ROWS);
+            "              ★超えたら打ち切り、end に cut を付けて言います\n"
+            "  --max-out   受け取らない接続を切るまでの溜まり（バイト・既定 %lu）\n",
+            me, DEFAULT_PORT, DEFAULT_MAX_ROWS, (unsigned long)DEFAULT_MAX_OUT);
 }
 
 int main(int argc, char **argv) {
@@ -384,6 +390,7 @@ int main(int argc, char **argv) {
     struct sockaddr_in addr;
     int i, port = DEFAULT_PORT, idle = 0, nconn = 0, rc = 0, yes = 1;
     long max_rows = DEFAULT_MAX_ROWS;
+    unsigned long max_out = DEFAULT_MAX_OUT, high_water = DEFAULT_HIGH_WATER;
     const char *path = NULL;
     time_t last = time(NULL);
     char name[64];
@@ -413,6 +420,8 @@ int main(int argc, char **argv) {
             idle = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--max-rows") == 0 && i + 1 < argc) {
             max_rows = atol(argv[++i]);
+        } else if (strcmp(argv[i], "--max-out") == 0 && i + 1 < argc) {
+            max_out = strtoul(argv[++i], NULL, 10);
         } else if (argv[i][0] == '-') {
             usage(argv[0]);
             return 2;
@@ -423,10 +432,12 @@ int main(int argc, char **argv) {
             return 2;
         }
     }
-    if (!path || port <= 0 || port > 65535 || idle < 0 || max_rows < 0) {
+    if (!path || port <= 0 || port > 65535 || idle < 0 || max_rows < 0 || max_out < 4096) {
         usage(argv[0]);
         return 2;
     }
+    /* ★関所は切る線より小さくします（読むのをやめる前に切る形にしないため） */
+    if (high_water > max_out / 2) high_water = max_out / 2;
 
     memset(conns, 0, sizeof conns);
     signal(SIGINT, on_signal);
@@ -508,7 +519,7 @@ int main(int argc, char **argv) {
              * ★溜まりが多い接続からは、新しい問い合わせを読みません。
              *   読むと、相手が読まないまま仕事が積み増されます。
              */
-            if (conns[i].out.n < HIGH_WATER) FD_SET(conns[i].s, &rd);
+            if (conns[i].out.n < high_water) FD_SET(conns[i].s, &rd);
             if (conns[i].out.n) {
                 FD_SET(conns[i].s, &wr);
                 nwr++;
@@ -576,7 +587,7 @@ int main(int argc, char **argv) {
 #endif
                 }
                 /* ★溜まりが多くなったら、そこで読むのをやめます */
-                while (!drop && !conns[i].bye && conns[i].out.n < HIGH_WATER) {
+                while (!drop && !conns[i].bye && conns[i].out.n < high_water) {
                     char *body = NULL;
                     size_t blen = 0, used;
                     const char *why = NULL;
@@ -600,7 +611,7 @@ int main(int argc, char **argv) {
              * ★読まない相手で溜まりが膨らんだら、その接続を切ります。
              *   切らないと、1 本のために他の全員が待たされます。
              */
-            if (!drop && conns[i].out.n > MAX_OUT) {
+            if (!drop && conns[i].out.n > max_out) {
                 fprintf(stderr, "yuid: 受け取らない接続を切りました（溜まり %lu バイト）\n",
                         (unsigned long)conns[i].out.n);
                 drop = 1;

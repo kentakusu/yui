@@ -266,23 +266,56 @@ else
     wait "$DEAFPID" 2> /dev/null
 
     # --- その 2: 溜まりが切る線を超えたら、その接続を切ること
-    #     1 万件ぶん ≒ 9 MB で、切る線（8 MB）を超えます
-    : > "$D/log4"
+    #
+    # ★切る線を小さくしたデーモンを別に立てます。既定の 8 MB のままだと、
+    #   **OS の緩衝がそれだけ飲み込んでしまう土台**があり（macOS の CI で実測）、
+    #   溜まりが線を超えず、検査が噛みません。
+    #   OS の緩衝の大きさに依存しない形にするため、線のほうを小さくします。
+    CUTF="$D/cut.yui"
+    cp "$DEAFF" "$CUTF"
+    CUTPORT=0
+    i=39251
+    while [ "$i" -lt 39260 ]; do
+        "$YUID" "$CUTF" --port "$i" --idle 600 --max-rows 0 --max-out 65536 \
+            > "$D/log5" 2>&1 &
+        echo $! > "$D/pid5"
+        j=0
+        while [ "$j" -lt 50 ]; do
+            if grep -q "で待っています" "$D/log5" 2> /dev/null; then break; fi
+            if ! kill -0 "$(cat "$D/pid5")" 2> /dev/null; then break; fi
+            j=$((j + 1))
+            sleep 0.1
+        done
+        if grep -q "で待っています" "$D/log5" 2> /dev/null; then
+            CUTPORT=$i
+            break
+        fi
+        kill "$(cat "$D/pid5")" 2> /dev/null
+        i=$((i + 1))
+    done
+    if [ "$CUTPORT" -eq 0 ]; then
+        ng=$((ng + 1))
+        echo "NG   切る線を小さくしたデーモンが立ちませんでした: $(cat "$D/log5")"
+    else
+    DEAFPORT=$CUTPORT
     "$SAY" "$DEAFPORT" --deaf 15 '一覧 ()' > /dev/null 2>&1 &
     DEAFPID2=$!
     j=0
     while [ "$j" -lt 100 ]; do
-        if grep -q "受け取らない接続を切りました" "$D/log4" 2> /dev/null; then break; fi
+        if grep -q "受け取らない接続を切りました" "$D/log5" 2> /dev/null; then break; fi
         j=$((j + 1))
         sleep 0.1
     done
-    has "受け取らない接続を切りました" "$(cat "$D/log4")" \
+    has "受け取らない接続を切りました" "$(cat "$D/log5")" \
         "溜まりが切る線を超えたら、その接続を切ること"
     # ★切ったあとも、デーモンは生きていて他に答えること
-    out=$("$SAY" "$DEAFPORT" '一覧 (案件:) 名前だけ' 2>&1)
+    out=$("$SAY" "$CUTPORT" '一覧 (案件:) 名前だけ' 2>&1)
     has '"kind":"end","rc":0' "$out" "接続を切ったあともデーモンが生きていること"
     kill "$DEAFPID2" 2> /dev/null
     wait "$DEAFPID2" 2> /dev/null
+    kill "$(cat "$D/pid5")" 2> /dev/null
+    wait "$(cat "$D/pid5")" 2> /dev/null
+    fi
 
     kill "$(cat "$D/pid4")" 2> /dev/null
     wait "$(cat "$D/pid4")" 2> /dev/null

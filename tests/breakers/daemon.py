@@ -96,7 +96,7 @@ BREAKS = [
         "溜まりが膨らんでも接続を切らない",
         [
             (
-                "            if (!drop && conns[i].out.n > MAX_OUT) {",
+                "            if (!drop && conns[i].out.n > max_out) {",
                 "            if (0) {",
             )
         ],
