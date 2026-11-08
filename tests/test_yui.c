@@ -765,6 +765,17 @@ static void steal_lock(const char *lpath) {
 }
 #endif
 
+/* 錠の中身から tag= の値を取り出します */
+static void tag_of(const char *body, char *buf, size_t n) {
+    const char *s = strstr(body, "\ntag=");
+    size_t i = 0;
+    buf[0] = 0;
+    if (!s) return;
+    s += 5;
+    for (; s[i] && s[i] != '\n' && i + 1 < n; i++) buf[i] = s[i];
+    buf[i] = 0;
+}
+
 /*
  * 土台をまたいで効く錠（yui_open_locked / yui_lock_owner）。
  * ★ここで見ているのは「同じ土台の中で、錠の決まりどおりに動くか」です。
@@ -885,7 +896,54 @@ static void lock_tests(void) {
          "状況を作る差し込み口が -DYUI_SELFCHECK のビルドにしかありません");
 #endif
 
-    /* 9. ★既定 off。ふつうに開いたら錠を作らない */
+    /* 9. ★錠の印（tag）が毎回 変わること
+     *    材料が time() だけだと、同じ秒に 2 つが壊して取り合ったとき
+     *    両方が「自分の印」を見てしまいます（wasm で実測されました）。
+     *    ここは同じ秒に 2 回 開いて、印が変わることを見ています。 */
+    {
+        char tag1[32], tag2[32];
+        tag1[0] = tag2[0] = 0;
+        if (yui_open_locked(TMP, "印の試験", 0, &db) == YUI_OK) {
+            owner[0] = 0;
+            yui_lock_owner(TMP, owner, sizeof owner);
+            tag_of(owner, tag1, sizeof tag1);
+        }
+        yui_close(db);
+        if (yui_open_locked(TMP, "印の試験", 0, &db) == YUI_OK) {
+            owner[0] = 0;
+            yui_lock_owner(TMP, owner, sizeof owner);
+            tag_of(owner, tag2, sizeof tag2);
+        }
+        yui_close(db);
+        ok("錠の印が取れること", tag1[0] != 0 && tag2[0] != 0, tag1);
+        ok("錠の印が毎回 変わること", strcmp(tag1, tag2) != 0, tag1);
+    }
+
+    /* 10. 読むだけで開くと、ファイルを変える言葉を断ること */
+    if (yui_open_locked(TMP, "読むだけの試験", YUI_READONLY, &db) == YUI_OK) {
+        int i;
+        static const char *const writes[] = {"作る (人:新顔)", "結ぶ (人:田中)-[印]->(人:新顔)",
+                                             "消す (人:田中)", "詰め直す", NULL};
+        static const char *const reads[] = {"一覧 (人:)", "見る (人:田中)", "探す \"田中\"",
+                                            "辿る (人:田中)-[]->()", "手引き", "同期", NULL};
+        for (i = 0; writes[i]; i++) {
+            char nm[96];
+            snprintf(nm, sizeof nm, "読むだけなら断ること: %s", writes[i]);
+            ok(nm, yui_exec(db, writes[i], NULL, NULL) == YUI_ERROR, NULL);
+        }
+        ok("断る理由が「読むだけで開いています」であること",
+           starts(yui_errmsg(db), "読むだけで開いています"), yui_errmsg(db));
+        for (i = 0; reads[i]; i++) {
+            char nm[96];
+            snprintf(nm, sizeof nm, "読むだけでも通ること: %s", reads[i]);
+            ok(nm, yui_exec(db, reads[i], NULL, NULL) == YUI_OK, yui_errmsg(db));
+        }
+    } else {
+        ok("下ごしらえ（読むだけで開く）", 0, yui_errmsg(db));
+    }
+    yui_close(db);
+
+    /* 11. ★既定 off。ふつうに開いたら錠を作らない */
     if (yui_open(TMP, &db) == YUI_OK)
         ok("ふつうに開くと錠を作らないこと", !file_exists(TMPLOCK), NULL);
     else

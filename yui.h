@@ -53,8 +53,9 @@ typedef int (*yui_cb)(void *ctx, int kind, const char *text);
  */
 int yui_open(const char *path, yui **db);
 
-/* yui_open_locked の旗 */
+/* yui_open_locked の旗（足し合わせて渡せます） */
 #define YUI_LOCK_BREAK 1 /* 塞がれていたら壊して取る */
+#define YUI_READONLY   2 /* 書き込む言葉（作る 結ぶ 消す 詰め直す）を断る */
 
 /*
  * yui_open と同じですが、`<パス>.錠` も取ります。
@@ -73,6 +74,11 @@ int yui_open(const char *path, yui **db);
  *
  * flags に YUI_LOCK_BREAK を入れると、塞がれていたときに壊して取ります。
  * 入れなければ、持ち主を名乗って YUI_ERROR で返ります（yui_errmsg() に錠の中身が入ります）。
+ *
+ * flags に YUI_READONLY を入れると、ファイルを変える言葉（作る 結ぶ 消す 詰め直す）を
+ * 断ります。★これはライブラリの中の関所で、OS が止めるわけではありません
+ *   （ファイルは読み書きで開きます）。「自分のバグで書いてしまう」を防ぐためのもので、
+ *   他人が書くのを防ぐものではありません。
  *
  * ★持ち主が落ちても錠は外れません（flock は外れます）。
  *   「壊してよいか」は結には判断できません——pid の生死は同じ土台の中でしか見られず、

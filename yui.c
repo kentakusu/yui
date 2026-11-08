@@ -26,6 +26,9 @@
 #  include <sys/file.h>
 #  include <sys/stat.h>
 #  include <unistd.h>
+#  if defined(__APPLE__)
+#    include <sys/random.h> /* getentropy。glibc は unistd.h に在ります */
+#  endif
 #endif
 
 typedef uint8_t u8;
@@ -345,7 +348,8 @@ struct yui {
     yui_cb cb;
     void *ctx;
     int stopped;
-    int json; /* 1 なら 1 行 1 つの JSON で出す（yui_exec_json） */
+    int readonly; /* 1 なら書き込む言葉を断る（YUI_READONLY で開いたとき） */
+    int json;     /* 1 なら 1 行 1 つの JSON で出す（yui_exec_json） */
     int in_replay;
 };
 
@@ -2540,11 +2544,46 @@ static const char *const HELP[] = {
     "点の書き方: (名前)  (ラベル:名前)  (ラベル:)  (?なんでも)  ()",
     NULL};
 
+static int cmd_sync(P *p) {
+    yui *db = p->db;
+    if (fsync(db->fd) != 0) {
+        set_err(db, "同期に失敗しました: %s", strerror(errno));
+        return 1;
+    }
+    emit(db, YUI_SUMMARY, "同期しました");
+    return 0;
+}
+
+static int cmd_help(P *p) {
+    int i;
+    for (i = 0; HELP[i]; i++) emit(p->db, YUI_ROW, HELP[i]);
+    return 0;
+}
+
+/*
+ * 言葉の振り分け表。
+ * ★writes は「ファイルを変えるか」です。読むだけで開いたときに断る判定が
+ *   ここだけに在るので、言葉を足す人は必ず writes を書くことになります。
+ *   デーモンのような外側に動詞の一覧を持たせると、言葉が増えたとき黙ってズレます。
+ */
+typedef struct {
+    const char *kw;
+    int (*fn)(P *p);
+    int writes;
+} Cmd;
+
+static const Cmd CMDS[] = {{"作る", cmd_make, 1},    {"結ぶ", cmd_link, 1},
+                           {"探す", cmd_search, 0},  {"辿る", cmd_walk, 0},
+                           {"見る", cmd_show, 0},    {"一覧", cmd_list, 0},
+                           {"消す", cmd_delete, 1},  {"詰め直す", cmd_repack, 1},
+                           {"同期", cmd_sync, 0},    {"手引き", cmd_help, 0},
+                           {NULL, NULL, 0}};
+
 /* 1 文を実行。空の文なら何もしない。戻り値は YUI_* */
 static int exec_stmt(P *p) {
     yui *db = p->db;
     char *kw;
-    int rc = 0, s;
+    int rc = 0, s, i;
     s = peek(p);
     if (s == 0) return YUI_OK;
     if (s == '\n' || s == '\x01') {
@@ -2558,29 +2597,18 @@ static int exec_stmt(P *p) {
         perr(p, "文の始まりが分かりません");
         return YUI_ERROR;
     }
-    if (strcmp(kw, "作る") == 0) rc = cmd_make(p);
-    else if (strcmp(kw, "結ぶ") == 0) rc = cmd_link(p);
-    else if (strcmp(kw, "探す") == 0) rc = cmd_search(p);
-    else if (strcmp(kw, "辿る") == 0) rc = cmd_walk(p);
-    else if (strcmp(kw, "見る") == 0) rc = cmd_show(p);
-    else if (strcmp(kw, "一覧") == 0) rc = cmd_list(p);
-    else if (strcmp(kw, "消す") == 0) rc = cmd_delete(p);
-    else if (strcmp(kw, "詰め直す") == 0) rc = cmd_repack(p);
-    else if (strcmp(kw, "同期") == 0) {
-        if (fsync(db->fd) != 0) {
-            set_err(db, "同期に失敗しました: %s", strerror(errno));
-            return YUI_ERROR;
-        }
-        emit(db, YUI_SUMMARY, "同期しました");
-    } else if (strcmp(kw, "手引き") == 0) {
-        int i;
-        for (i = 0; HELP[i]; i++) emit(db, YUI_ROW, HELP[i]);
-    } else if (strcmp(kw, "終わる") == 0) {
-        return YUI_END;
-    } else {
+    if (strcmp(kw, "終わる") == 0) return YUI_END;
+    for (i = 0; CMDS[i].kw; i++)
+        if (strcmp(kw, CMDS[i].kw) == 0) break;
+    if (!CMDS[i].kw) {
         set_err(db, "知らない言葉です: %s（「手引き」で一覧を出せます）", kw);
         return YUI_ERROR;
     }
+    if (CMDS[i].writes && db->readonly) {
+        set_err(db, "読むだけで開いています。%s は使えません", kw);
+        return YUI_ERROR;
+    }
+    rc = CMDS[i].fn(p);
     if (rc != 0) return YUI_ERROR;
     s = peek(p);
     if (s != 0 && s != '\n' && s != '\x01') {
@@ -3092,12 +3120,37 @@ static void lock_clean(const char *src, char *buf, size_t n) {
     }
 }
 
-/* 壊して取ったあと「自分のものか」を読み返して確かめるための印 */
+/*
+ * 壊して取ったあと「自分のものか」を読み返して確かめるための印。
+ *
+ * ★土台によって材料が足りません。wasm では getpid() が 42 固定で、
+ *   スタックの番地もインスタンスの間で同じなので、time() だけが動きます。
+ *   それだけだと、同じ秒に 2 つが壊して取り合ったとき、両方が
+ *   「自分の印が入っている」を見てしまいます（実測で見つかりました）。
+ *   そこで、秒より細かい時計と乱数を混ぜます。
+ */
 static u64 lock_tag(void) {
+    static u64 seq = 0;
     u64 t = (u64)time(NULL);
     u64 p = (u64)(unsigned long)getpid();
     u64 a = (u64)(uintptr_t)&t;
-    return (t << 20) ^ (p << 7) ^ a ^ (a >> 19);
+    u64 fine = 0, r = 0;
+#ifdef _WIN32
+    {
+        FILETIME ft; /* 100 ナノ秒きざみ */
+        GetSystemTimeAsFileTime(&ft);
+        fine = ((u64)ft.dwHighDateTime << 32) | (u64)ft.dwLowDateTime;
+    }
+#else
+    {
+        struct timespec ts;
+        if (clock_gettime(CLOCK_REALTIME, &ts) == 0)
+            fine = (u64)ts.tv_sec * 1000000000u + (u64)ts.tv_nsec;
+        /* ★wasm で効くのはここです。番地も pid も動かないので、乱数だけが頼りです */
+        if (getentropy(&r, sizeof r) != 0) r = 0;
+    }
+#endif
+    return r ^ fine ^ (t << 20) ^ (p << 7) ^ a ^ (a >> 19) ^ (++seq << 40);
 }
 
 /* 錠の中身。★キーは ASCII です（機械で読む側のため） */
@@ -3232,6 +3285,7 @@ int yui_open_locked(const char *path, const char *name, int flags, yui **out) {
         return YUI_ERROR;
     }
     db->path = xstrdup(path);
+    db->readonly = (flags & YUI_READONLY) ? 1 : 0;
 
     /*
      * ★錠を flock より先に当てます。順番が逆だと、同じ土台どうしの衝突が
