@@ -174,6 +174,46 @@ jobs:
           if ($left -notmatch "人:鈴木") { throw "書いたものが残っていません: $left" }
           Write-Host "詰め直す の入れ替えの失敗: 通りました"
 
+      # ★--read / --wait / --json は tests/cli.sh が見ていますが、sh が要るので
+      #   Windows では動きません。ここでは同じことを pwsh で見ます。
+      #   ★--read は Windows では別の道を通ります（LockFileEx を排他の印なしで
+      #     呼ぶ＝共有の錠）。POSIX の flock(LOCK_SH) とは別の実装なので、
+      #     ここで通さないと「Windows では効くのか」が誰にも分かりません。
+      - name: CLI の --read / --wait / --json
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+          .\yui.exe rw.yui "作る (人:田中 {役職: `"部長`"})" | Out-Null
+
+          # --read で読める。★<パス>.錠 は作らない（短命なプロセスなので）
+          $out = (.\yui.exe --read rw.yui "一覧 (人:) 名前だけ" | Out-String)
+          if ($LASTEXITCODE -ne 0) { throw "--read で読めません: $out" }
+          if ($out -notmatch "人:田中") { throw "--read の結果が違います: $out" }
+          if (Test-Path "rw.yui.錠") { throw "CLI が <パス>.錠 を作っています" }
+
+          # --read では書けない
+          $out = (.\yui.exe --read rw.yui "作る (人:新顔)" 2>&1 | Out-String)
+          if ($LASTEXITCODE -eq 0) { throw "--read で書けてしまいました: $out" }
+          if ($out -notmatch "読むだけで開いています") { throw "断る理由が違います: $out" }
+
+          # --read と --json を一緒に使える
+          $out = (.\yui.exe --read --json rw.yui "一覧 (人:) 名前だけ" | Out-String)
+          if ($out -notmatch '"kind":"node"') { throw "--read --json が効きません: $out" }
+
+          # --wait を付けても、塞がっていなければそのまま書ける
+          $out = (.\yui.exe --wait 5 rw.yui "作る (人:待った)" | Out-String)
+          if ($LASTEXITCODE -ne 0) { throw "--wait で書けません: $out" }
+
+          # ★知らない旗は断る（通すとファイル名として扱われ、その名前の
+          #   新しいファイルが黙って作られます）
+          $out = (.\yui.exe --jsn rw.yui "一覧 ()" 2>&1 | Out-String)
+          if ($LASTEXITCODE -ne 2) { throw "知らない旗の終了コードが 2 ではありません: $out" }
+          if ($out -notmatch "知らない旗です") { throw "知らない旗だと言いません: $out" }
+          if (Test-Path "--jsn") { throw "綴り違いの旗がファイルになっています" }
+          $global:LASTEXITCODE = 0
+          Write-Host "CLI の --read / --wait / --json: 通りました"
+
       # ★tests/daemon.sh は sh が要るので Windows では動きません。ここでは
       #   同じ道具（tests/yuid_say.c）を使って、要点だけを見ます。
       #   見ているもの: 立つ・錠を作る・読める・書き込みを断る・2 本 目は立たない・

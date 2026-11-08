@@ -746,8 +746,9 @@ static void direct_tests(void) {
     skip("Windows の CLI の一部",
          "CLI の振る舞いは tests/cli.sh が見ていますが、sh が要るので Windows では"
          "動きません。Windows は CI の pwsh の段で、終了コード・行番号・NUL・"
-         "詰め直す の入れ替えの失敗だけを見ています（端末として開いたときと --json は"
-         "見ていません）");
+         "詰め直す の入れ替えの失敗・--read / --wait / --json / 知らない旗 を見ています。"
+         "★見ていないのは 2 つで、端末として開いたときの道と、"
+         "「同時に 2 本 読めること」（Windows で、開いたまま居座らせる手が作れていません）");
 
     clean();
 }

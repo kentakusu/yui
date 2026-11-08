@@ -91,6 +91,13 @@ if errorlevel 1 (
   echo ビルドに失敗しました（yuid_say）
   exit /b 1
 )
+rem ★yui.exe も作り直します。作らないと、古い yui.exe が残ったまま
+rem   「旗が効かない」のような誤診をします（実際に踏みました）。
+cl %CFLAGS% /Fe:yui.exe yui.c yui_cli.c
+if errorlevel 1 (
+  echo ビルドに失敗しました（yui）
+  exit /b 1
+)
 set "CASES="
 for %%F in (tests\cases\*.txt) do set "CASES=!CASES! tests\cases\%%~nxF"
 if not defined CASES (
