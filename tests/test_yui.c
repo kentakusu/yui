@@ -41,6 +41,8 @@
 #define TMPFRAG "yui_test_tmp.yui.断片"
 #define TMPPACK "yui_test_tmp.yui.詰" /* 詰め直す の作業用。残っていたら失敗 */
 #define TMPLOCK "yui_test_tmp.yui.錠" /* 土台をまたぐ錠 */
+/* ★開けない場所（置き場が無い）。錠でない失敗の対照に使います */
+#define TMPDIR_MISSING "yui_test_無い置き場/t.yui"
 #define MAXROW  256
 
 static int ng = 0;      /* 失敗した数 */
@@ -967,6 +969,32 @@ static void lock_tests(void) {
     else
         ok("下ごしらえ（ふつうに開く）", 0, yui_errmsg(db));
     yui_close(db);
+
+    /*
+     * 14. ★yui_busy()：「あとで試せば通る失敗」かを見分けられること
+     *   ★これが無いと、呼ぶ側は錠と文法の誤りを区別できず、
+     *   途中まで実行された書き込みをもう一度 流すことになります。
+     *   ★文面で場合分けさせないための口です。
+     */
+    if (yui_open_locked(TMP, "先の持ち主", 0, &db) == YUI_OK) {
+        yui *b2 = NULL;
+        ok("開けたときの yui_busy は 0", yui_busy(db) == 0, NULL);
+        ok("2 本目は断られること",
+           yui_open_locked(TMP, "あとから", 0, &b2) == YUI_ERROR, NULL);
+        ok("★錠で断られたなら yui_busy が 1", yui_busy(b2) == 1, yui_errmsg(b2));
+        yui_close(b2);
+    } else {
+        ok("下ごしらえ（先に錠を取る）", 0, yui_errmsg(db));
+    }
+    yui_close(db);
+    {
+        /* ★錠でない失敗では 0。ここが 1 なら、見分けたことにならない */
+        yui *b3 = NULL;
+        ok("開けない場所は断ること",
+           yui_open(TMPDIR_MISSING, &b3) == YUI_ERROR, NULL);
+        ok("★錠でない失敗は yui_busy が 0", yui_busy(b3) == 0, yui_errmsg(b3));
+        yui_close(b3);
+    }
 
     clean();
 }

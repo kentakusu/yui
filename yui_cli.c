@@ -184,9 +184,17 @@ int main(int argc, char **argv) {
     if (yui_open_full(path, NULL,
                       YUI_NO_LOCKFILE | (readonly ? (YUI_READONLY | YUI_SHARED) : 0),
                       wait_s * 1000, &db) != YUI_OK) {
+        /*
+         * ★錠で断られたときだけ、別の終了コード（3）にします。
+         *   1 のままだと、呼ぶ側が「あとで試せば通る失敗」と
+         *   「何回試しても同じ失敗」を見分けられず、
+         *   ★**途中まで実行された書き込みをもう一度 流す**ことになります。
+         *   文面で場合分けするより安全です（文面は変わります）。
+         */
+        int busy = yui_busy(db);
         say_err(json, 0, yui_errmsg(db));
         yui_close(db);
-        return 1;
+        return busy ? 3 : 1;
     }
     /* ★お知らせは標準エラーへ出します。結果（標準出力）に混ぜないので、
      *   `yui --json … | jq` の邪魔にはなりません。

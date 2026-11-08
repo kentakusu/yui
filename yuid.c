@@ -11,6 +11,10 @@
  *   「誰が・いつ」をデーモンが押します。設計は docs/デーモンの構想.md が正です。
  *
  * ★127.0.0.1 にしか出しません。LAN へ出すのは段 3 で、合言葉が要ります。
+ *
+ * ★終了コード: 0 正常に終わった / 2 使い方の誤り /
+ *   **3 ほかが先に持っている**（口かファイルの錠。あとで建て直せばよい）/
+ *   1 それ以外（何回試しても同じ）
  *   `networkingMode=Mirrored` の環境では 127.0.0.1 が Windows と WSL2 で
  *   共有されるので、これだけで両方から使えます（既定の NAT では共有されません）。
  *
@@ -485,7 +489,7 @@ int main(int argc, char **argv) {
                 "もう 1 つ立っているか、別のものが使っています\n",
                 port);
         sock_close(lis);
-        return 1;
+        return 3; /* ★ほかが先に持っている。あとで建て直せばよい */
     }
     if (listen(lis, 8) != 0) {
         fputs("yuid: 待ち受けを始められません\n", stderr);
@@ -495,10 +499,13 @@ int main(int argc, char **argv) {
 
     snprintf(name, sizeof name, "yuid %s port=%d", YUI_VERSION, port);
     if (yui_open_locked(path, name, YUI_READONLY, &db) != YUI_OK) {
+        /* ★錠で断られたときは 3。CLI と揃えます
+         *   （見張る仕組みが「あとで建て直せばよい」と判できるように） */
+        int busy = yui_busy(db);
         fprintf(stderr, "yuid: %s\n", yui_errmsg(db));
         yui_close(db);
         sock_close(lis);
-        return 1;
+        return busy ? 3 : 1;
     }
     if (yui_notice(db)) fprintf(stderr, "yuid: お知らせ: %s\n", yui_notice(db));
     fprintf(stderr, "yuid: 127.0.0.1:%d で待っています（読むだけ・返りは %ld 行まで）: %s\n", port,

@@ -238,6 +238,17 @@ jobs:
           if (-not (Test-Path "d.yui.錠")) { throw "錠を作っていません" }
           if ((Get-Content "d.yui.錠" -Raw) -notmatch "yuid") { throw "錠に名乗りがありません" }
 
+          # ★錠で断られたときの終了コードが 3 であること（Windows ではここでしか見られません。
+          #   デーモンが錠を握っているこの間だけが、塞がった状態を作れる所です）
+          # ★対照を一緒に取ります。**全部が 3 なら「見分けた」ことにならない**ので。
+          .\yui.exe d.yui "一覧 ()" 2>&1 | Out-Null
+          if ($LASTEXITCODE -ne 3) { throw "錠で断られたときの終了コードが 3 ではありません: $LASTEXITCODE" }
+          .\yui.exe free.yui "でたらめ" 2>&1 | Out-Null
+          if ($LASTEXITCODE -ne 1) { throw "文法の誤りの終了コードが 1 ではありません: $LASTEXITCODE" }
+          .\yui.exe --jsn d.yui "一覧 ()" 2>&1 | Out-Null
+          if ($LASTEXITCODE -ne 2) { throw "知らない旗の終了コードが 2 ではありません: $LASTEXITCODE" }
+          $global:LASTEXITCODE = 0
+
           $out = (.\yuid_say.exe 39240 "一覧 ()" | Out-String)
           if ($out -notmatch '"name":"田中"') { throw "読めません: $out" }
           if ($out -notmatch '"役職":"部長"') { throw "属性が返りません: $out" }
@@ -280,7 +291,7 @@ jobs:
           # ★2 本 目は立たないこと（Windows の SO_REUSEADDR は 2 つ目を通すので、
           #   SO_EXCLUSIVEADDRUSE が効いているかを見る段でもあります）
           $second = (.\yuid.exe d.yui --port 39240 2>&1 | Out-String)
-          if ($LASTEXITCODE -eq 0) { throw "2 本 目が立ってしまいました: $second" }
+          if ($LASTEXITCODE -ne 3) { throw "2 本 目が「ほかが先に持っている（3）」で終わっていません: $LASTEXITCODE / $second" }
           if ($second -match "で待っています") { throw "2 本 目が待ち受けを始めました: $second" }
           # ★pwsh の段の終了コードは「最後に走った実行ファイルの終了コード」に
           #   なります。いま意図して yuid.exe を失敗させたので、そのままだと

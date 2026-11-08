@@ -350,6 +350,7 @@ struct yui {
     int stopped;
     int readonly; /* 1 なら書き込む言葉を断る（YUI_READONLY で開いたとき） */
     int shared;   /* 1 なら錠を共有で取る（読む人どうしは待たない） */
+    int busy;     /* 1 なら「錠が取れなかった」。yui_busy() が返します */
     int json;     /* 1 なら 1 行 1 つの JSON で出す（yui_exec_json） */
     int in_replay;
 };
@@ -3359,6 +3360,7 @@ static int open_body(yui *db, int wait_ms) {
         nap = next_nap(wait_ms, &slept, &step);
         if (!nap) {
             set_err(db, "別のところで開かれています: %s", db->path);
+            db->busy = 1; /* あとで試せば通るかもしれない失敗です */
             goto fail;
         }
         nap_ms(nap);
@@ -3443,8 +3445,10 @@ int yui_open_full(const char *path, const char *name, int flags, int wait_ms, yu
             got[0] = 0;
             lock_slurp(lpath, got, sizeof got);
             set_err(db, "別のところが錠を持っています: %s\n%s", lpath, got);
+            db->busy = 1;
         } else if (rc == 2) {
             set_err(db, "錠を取り合って負けました: %s", lpath);
+            db->busy = 1;
         }
         free(lpath);
         return YUI_ERROR;
@@ -3468,6 +3472,16 @@ const char *yui_errmsg(yui *db) {
     return db->err ? db->err : "";
 }
 const char *yui_notice(yui *db) { return db ? db->notice : NULL; }
+
+/*
+ * 直前の yui_open・・・ が「錠が取れなかった」で失敗したなら 1 を返します。
+ * ★これを別に返すのは、**再試行してよい失敗かを見分けるため**です。
+ *   錠なら、あとで試せば通るかもしれません。
+ *   文法の誤りや壊れたファイルは、何回試しても同じです。
+ * ★戻り値（YUI_ERROR）は変えていません。変えると、
+ *   rc == YUI_ERROR と書いている使い手が、黙って「成功」と読みます。
+ */
+int yui_busy(const yui *db) { return db ? db->busy : 0; }
 
 int yui_close(yui *db) {
     int rc = YUI_OK;
