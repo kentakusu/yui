@@ -43,6 +43,12 @@ BREAKS = [
         ],
     ),
     (
+        "詰め直す が元の権限を引き継がない（秘匿のものを分けた意味が消える）",
+        "yui.c",
+        [("    if (keep_mode >= 0 && fchmod(fd, (mode_t)keep_mode) != 0) {",
+          "    if (0 && keep_mode >= 0 && fchmod(fd, (mode_t)keep_mode) != 0) {")],
+    ),
+    (
         "読むだけでも書けてしまう",
         "yui.c",
         [("    if (CMDS[i].writes && db->readonly) {", "    if (0) {")],

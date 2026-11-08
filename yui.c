@@ -2971,8 +2971,24 @@ static int repack(yui *db, u64 *nnode, u64 *nedge, u64 *before, u64 *after) {
     u64 cn = 0, ce = 0;
     size_t i;
     int fd;
+#ifndef _WIN32
+    int keep_mode = -1; /* 元のファイルの権限。-1 は「分からなかった」 */
+#endif
 
     *before = db->size;
+#ifndef _WIN32
+    /*
+     * ★元の権限を控えます。詰め直すと別のファイルになるので、
+     *   引き継がないと、持ち主が狭めた権限（chmod 600 など）が既定へ戻ります。
+     *   秘匿のものを別のファイルに分ける使い方では、
+     *   「うっかり書いたので 消す → 詰め直す」という手当てそのものが
+     *   権限を広げます（実測で踏みました。docs/秘匿のものの置き方.md）。
+     */
+    {
+        struct stat st;
+        if (fstat(db->fd, &st) == 0) keep_mode = (int)(st.st_mode & 07777);
+    }
+#endif
     if (build_packed(db, &img, nnode, nedge) != 0) goto fail;
     str_add(&tmp, db->path);
     str_add(&tmp, PACK_SUFFIX);
@@ -2989,6 +3005,21 @@ static int repack(yui *db, u64 *nnode, u64 *nedge, u64 *before, u64 *after) {
             set_err(db, "詰め直し用のファイルを作れません: %s: %s", tmp.p, strerror(errno));
         goto fail;
     }
+#ifndef _WIN32
+    /*
+     * ★権限を広げないこと。付けられなければ入れ替えません。
+     *   黙って広げる方が危ないので、ここは「できなければやらない」側に倒します。
+     * ★この呼び出しが 0 を返しても、効いたとは限りません（実測: WSL2 の
+     *   /mnt の下では 0 を返して権限は 777 のまま）。土台が権限を持たないときは、
+     *   そもそも守れていないので、結の側で区別しません。
+     */
+    if (keep_mode >= 0 && fchmod(fd, (mode_t)keep_mode) != 0) {
+        set_err(db, "詰め直し用のファイルに元の権限を付けられません: %s: %s", tmp.p,
+                strerror(errno));
+        close(fd);
+        goto fail_rm;
+    }
+#endif
     if (write_all(fd, img.p, img.n) != 0) {
         set_err(db, "詰め直し用のファイルに書けません: %s", strerror(errno));
         close(fd);
