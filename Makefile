@@ -1,9 +1,10 @@
 # 結（yui）— Linux / macOS / iOS / Android 用
 # Windows は build.bat を使ってください（MSVC）。
 #
-#   make              yui を作る
-#   make test         テストを流す（ライブラリと CLI）
+#   make              yui と yuid を作る
+#   make test         テストを流す（ライブラリと CLI とデーモン）
 #   make test-cli     CLI だけ流す
+#   make test-daemon  デーモンだけ流す
 #   make test-san     AddressSanitizer / UBSan を付けてテストを流す
 #   make test-wasm    wasm（emscripten）でテストを流す。emcc と node が要ります
 #   make san          sanitizer 付きの yui を作る
@@ -22,10 +23,14 @@ CASES    = $(wildcard tests/cases/*.txt)
 # テストのビルドだけに付けます。探すたびに索引と全件走査の答えを突き合わせます
 TESTDEF  = -DYUI_SELFCHECK
 
-all: yui
+all: yui yuid
 
-yui: yui.c yui_cli.c yui.h
+yui: yui.c yui_cli.c yui.h yui_argv.h
 	$(CC) $(WARN) $(CFLAGS) -o $@ yui.c yui_cli.c -lm
+
+# デーモン（段 1・読むだけ）。設計は docs/デーモンの構想.md
+yuid: yui.c yuid.c yui.h yui_argv.h
+	$(CC) $(WARN) $(CFLAGS) -o $@ yui.c yuid.c -lm
 
 san: build/yui_san
 
@@ -44,23 +49,37 @@ build:
 build/yui_test: yui.c tests/test_yui.c yui.h | build
 	$(CC) $(WARN) $(CFLAGS) $(TESTDEF) -o $@ yui.c tests/test_yui.c -lm
 
+# デーモンに話しかけるだけの道具（テスト専用）。土台を問わないので
+# CI の Windows の段も同じものを使います
+build/yuid_say: tests/yuid_say.c | build
+	$(CC) $(WARN) $(CFLAGS) -o $@ tests/yuid_say.c
+
 build/yui_test_san: yui.c tests/test_yui.c yui.h | build
 	$(CC) $(WARN) $(SAN) $(TESTDEF) -o $@ yui.c tests/test_yui.c -lm
 
 build/yui_test.js: yui.c tests/test_yui.c yui.h | build
 	$(EMCC) -std=c99 -O2 $(WASM) $(TESTDEF) -o $@ yui.c tests/test_yui.c
 
-test: build/yui_test yui
+test: build/yui_test yui yuid build/yuid_say
 	./build/yui_test $(CASES)
 	sh tests/cli.sh ./yui
+	sh tests/daemon.sh ./yuid ./build/yuid_say ./yui
 
-test-san: build/yui_test_san build/yui_san
+test-san: build/yui_test_san build/yui_san build/yuid_san build/yuid_say
 	./build/yui_test_san $(CASES)
 	sh tests/cli.sh ./build/yui_san
+	sh tests/daemon.sh ./build/yuid_san ./build/yuid_say ./build/yui_san
+
+build/yuid_san: yui.c yuid.c yui.h yui_argv.h | build
+	$(CC) $(WARN) $(SAN) -o $@ yui.c yuid.c -lm
 
 # CLI だけ流す
 test-cli: yui
 	sh tests/cli.sh ./yui
+
+# デーモンだけ流す
+test-daemon: yuid build/yuid_say yui
+	sh tests/daemon.sh ./yuid ./build/yuid_say ./yui
 
 test-wasm: build/yui_test.js
 	node build/yui_test.js $(CASES)
@@ -75,6 +94,6 @@ record: build/yui_test
 	done
 
 clean:
-	rm -rf build yui yui_test_tmp.yui yui_test_tmp.yui.断片 yui_test_tmp.yui.詰 yui_test_tmp.yui.錠
+	rm -rf build yui yuid yui_test_tmp.yui yui_test_tmp.yui.断片 yui_test_tmp.yui.詰 yui_test_tmp.yui.錠
 
 .PHONY: all san test test-san test-cli test-wasm record clean

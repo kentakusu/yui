@@ -1,5 +1,6 @@
 # ビルドで出来るもの
 yui
+yuid
 yui.exe
 *.o
 *.obj
@@ -12,3 +13,4 @@ build/
 *.yui
 *.断片
 *.詰
+*.錠

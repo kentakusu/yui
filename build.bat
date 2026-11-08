@@ -61,7 +61,13 @@ if errorlevel 1 (
   echo ビルドに失敗しました
   exit /b 1
 )
-echo できました: yui.exe
+rem デーモン（段 1・読むだけ）。設計は docs\デーモンの構想.md
+cl %CFLAGS% /Fe:yuid.exe yui.c yuid.c
+if errorlevel 1 (
+  echo ビルドに失敗しました（yuid）
+  exit /b 1
+)
+echo できました: yui.exe yuid.exe
 exit /b 0
 
 :test
@@ -70,6 +76,19 @@ rem /DYUI_SELFCHECK: 探すたびに索引と全件走査の答えを突き合�
 cl %CFLAGS% /DYUI_SELFCHECK /Fe:yui_test.exe yui.c tests\test_yui.c
 if errorlevel 1 (
   echo ビルドに失敗しました
+  exit /b 1
+)
+rem デーモンと、それに話しかける道具。tests\daemon.sh は sh が要るので
+rem Windows では動きませんが、話しかける道具は土台を問わないので、
+rem CI の pwsh の段がこれを使います（同じ検査を 2 回 書かないため）。
+cl %CFLAGS% /Fe:yuid.exe yui.c yuid.c
+if errorlevel 1 (
+  echo ビルドに失敗しました（yuid）
+  exit /b 1
+)
+cl %CFLAGS% /Fe:yuid_say.exe tests\yuid_say.c
+if errorlevel 1 (
+  echo ビルドに失敗しました（yuid_say）
   exit /b 1
 )
 set "CASES="

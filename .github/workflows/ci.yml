@@ -174,6 +174,59 @@ jobs:
           if ($left -notmatch "人:鈴木") { throw "書いたものが残っていません: $left" }
           Write-Host "詰め直す の入れ替えの失敗: 通りました"
 
+      # ★tests/daemon.sh は sh が要るので Windows では動きません。ここでは
+      #   同じ道具（tests/yuid_say.c）を使って、要点だけを見ます。
+      #   見ているもの: 立つ・錠を作る・読める・書き込みを断る・2 本 目は立たない・
+      #   止めると錠が外れる。細かいところは daemon.sh が POSIX で見ています。
+      - name: デーモン（段 1）が Windows で動くこと
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          .\yui.exe d.yui "作る (人:田中 {役職: `"部長`"})" | Out-Null
+          $p = Start-Process -FilePath ".\yuid.exe" `
+            -ArgumentList "d.yui","--port","39240","--idle","60" `
+            -PassThru -RedirectStandardError "yuid.err" -NoNewWindow
+          # 待ち受けの 1 行が出るまで待ちます（決め打ちの sleep にしません）
+          $i = 0
+          while ($i -lt 100) {
+            if ((Test-Path "yuid.err") -and (Get-Content "yuid.err" -Raw) -match "で待っています") { break }
+            if ($p.HasExited) { break }
+            Start-Sleep -Milliseconds 100; $i++
+          }
+          $log = if (Test-Path "yuid.err") { Get-Content "yuid.err" -Raw } else { "" }
+          if ($log -notmatch "で待っています") { throw "デーモンが立ちません: $log" }
+          if (-not (Test-Path "d.yui.錠")) { throw "錠を作っていません" }
+          if ((Get-Content "d.yui.錠" -Raw) -notmatch "yuid") { throw "錠に名乗りがありません" }
+
+          $out = (.\yuid_say.exe 39240 "一覧 ()" | Out-String)
+          if ($out -notmatch '"name":"田中"') { throw "読めません: $out" }
+          if ($out -notmatch '"役職":"部長"') { throw "属性が返りません: $out" }
+          if ($out -notmatch '"kind":"end","rc":0') { throw "締めの行がありません: $out" }
+
+          $out = (.\yuid_say.exe 39240 "作る (人:新顔)" | Out-String)
+          if ($out -notmatch "読むだけで開いています") { throw "書き込みを断りません: $out" }
+
+          # ★同じ接続で 2 回（持続接続）
+          $out = (.\yuid_say.exe 39240 "一覧 (人:)" "手引き" | Out-String)
+          if (($out | Select-String -AllMatches '"kind":"end"').Matches.Count -ne 2) {
+            throw "持続接続で 2 回 返っていません: $out"
+          }
+
+          # ★2 本 目は立たないこと（Windows の SO_REUSEADDR は 2 つ目を通すので、
+          #   SO_EXCLUSIVEADDRUSE が効いているかを見る段でもあります）
+          $second = (.\yuid.exe d.yui --port 39240 2>&1 | Out-String)
+          if ($LASTEXITCODE -eq 0) { throw "2 本 目が立ってしまいました: $second" }
+          if ($second -match "で待っています") { throw "2 本 目が待ち受けを始めました: $second" }
+
+          Stop-Process -Id $p.Id
+          $i = 0
+          while ($i -lt 100 -and (Test-Path "d.yui.錠")) { Start-Sleep -Milliseconds 100; $i++ }
+          # ★Stop-Process は合図を送らずに落とすので、錠は残ります。それが正しい姿
+          #   （落ちた持ち主の錠は残り、壊すかは使う側が決める）。ここではその確認です。
+          if (-not (Test-Path "d.yui.錠")) { throw "落とされた持ち主の錠が消えています（残るのが正しい）" }
+          Remove-Item "d.yui.錠"
+          Write-Host "デーモン（段 1）: 通りました"
+
       - name: 土台をまたぐ比較用のファイルを作る
         run: type tests\compat.txt | .\yui.exe compat.yui
 
