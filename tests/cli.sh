@@ -233,23 +233,19 @@ fi
 # ------------------------------------------------- 端末として開いたとき
 
 # ★isatty(0) が真のときだけ通る道です（呼び出しの合図を出す・行番号を出さない）。
-#   ふつうの流し込みでは通らないので、疑似端末を割り当てて測ります。
-#   script の書き方は GNU と BSD（macOS）で違うので、両方 試します。
+#   ふつうの流し込みでは通らないので、GNU の script で疑似端末を割り当てて測ります。
+# ★BSD（macOS）の script では測れません。疑似端末は作れますが、
+#   パイプで渡した入力が確実に渡りません。CI の macOS で実測したところ、
+#   合図と起動の 1 行は出るのに、命令の結果が出ませんでした
+#   （入力の echo のあとに ^D が出ており、読む前に終わりが来ています）。
+#   無理に通すより、見ていないと出すほうが正確なので、そうしています。
 PTY=""
-if (script -q -c "echo ok" /dev/null) > /dev/null 2>&1; then
-    PTY=gnu
-elif (script -q /dev/null echo ok) > /dev/null 2>&1; then
-    PTY=bsd
-fi
+if (script -q -c "echo ok" /dev/null) > /dev/null 2>&1; then PTY=gnu; fi
 run_pty() { # $1=ファイル、標準入力から命令を流す
-    if [ "$PTY" = gnu ]; then
-        script -q -c "$YUI $1" /dev/null 2>&1
-    else
-        script -q /dev/null "$YUI" "$1" 2>&1
-    fi
+    script -q -c "$YUI $1" /dev/null 2>&1
 }
 if [ -z "$PTY" ]; then
-    echo "-- 見ていません: 端末として開いたときの道（script が無いので疑似端末を作れません）"
+    echo "-- 見ていません: 端末として開いたときの道（GNU の script がありません。BSD の script では入力が渡らないので測れません）"
 else
     out=$(printf '一覧 ()
 これは誤り
