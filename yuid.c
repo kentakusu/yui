@@ -375,7 +375,12 @@ int main(int argc, char **argv) {
     memset(&addr, 0, sizeof addr);
     addr.sin_family = AF_INET;
     addr.sin_port = htons((unsigned short)port);
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK); /* ★127.0.0.1 だけ */
+    /*
+     * ★127.0.0.1 だけ。INADDR_LOOPBACK を使わないのは、macOS では
+     *   _POSIX_C_SOURCE を厳密に指定すると隠れるためです（CI で実測）。
+     *   土台ごとの旗（_DARWIN_C_SOURCE）を増やすより、数値で書くほうが portable です。
+     */
+    addr.sin_addr.s_addr = htonl(0x7f000001u);
     if (bind(lis, (struct sockaddr *)&addr, (int)sizeof addr) != 0) {
         fprintf(stderr,
                 "yuid: 127.0.0.1:%d を使えません。"

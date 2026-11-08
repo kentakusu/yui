@@ -217,6 +217,12 @@ jobs:
           $second = (.\yuid.exe d.yui --port 39240 2>&1 | Out-String)
           if ($LASTEXITCODE -eq 0) { throw "2 本 目が立ってしまいました: $second" }
           if ($second -match "で待っています") { throw "2 本 目が待ち受けを始めました: $second" }
+          # ★pwsh の段の終了コードは「最後に走った実行ファイルの終了コード」に
+          #   なります。いま意図して yuid.exe を失敗させたので、そのままだと
+          #   全部 通っても exit 1 で落ちます（実測）。ここで打ち消します。
+          #   ★末尾に exit 0 を置く形にはしません。そうすると、このあとで
+          #     実行ファイルが落ちても拾えなくなります（安全網を外さない）。
+          $global:LASTEXITCODE = 0
 
           Stop-Process -Id $p.Id
           $i = 0

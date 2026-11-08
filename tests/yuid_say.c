@@ -158,7 +158,7 @@ int main(int argc, char **argv) {
     memset(&a, 0, sizeof a);
     a.sin_family = AF_INET;
     a.sin_port = htons((unsigned short)port);
-    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    a.sin_addr.s_addr = htonl(0x7f000001u); /* ★INADDR_LOOPBACK は macOS で隠れます */
     if (connect(s, (struct sockaddr *)&a, (int)sizeof a) != 0) {
         fprintf(stderr, "繋がりません: 127.0.0.1:%d\n", port);
         sock_close(s);
