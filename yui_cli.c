@@ -72,17 +72,9 @@ static int print_row(void *ctx, int kind, const char *text) {
     return 0;
 }
 
-/*
- * --json のときの失敗の出し方。1 行 1 つの JSON で、標準エラーへ出します。
- * ★本体の yui_exec_json は結果だけを JSON にします。失敗の理由は
- *   yui_errmsg() が返す人向けの文なので、包むのは呼ぶ側（ここ）の仕事です。
- * ★包む相手は結の出した文ですが、その中に利用者が書いた名前が入ります。
- *   引用符や改行が混ざっても壊れないように、ここで逃がします。
- */
-static void print_json_err(unsigned long lineno, const char *text) {
-    fputs("{\"kind\":\"error\"", stderr);
-    if (lineno) fprintf(stderr, ",\"line\":%lu", lineno);
-    fputs(",\"text\":\"", stderr);
+/* 文字列を JSON の値として標準エラーへ出す（引用符ごと） */
+static void put_json_str(const char *text) {
+    fputc('"', stderr);
     for (; *text; text++) {
         unsigned char c = (unsigned char)*text;
         if (c == '"' || c == '\\') {
@@ -100,7 +92,33 @@ static void print_json_err(unsigned long lineno, const char *text) {
             fputc((char)c, stderr);
         }
     }
-    fputs("\"}\n", stderr);
+    fputc('"', stderr);
+}
+
+/* 開いたときのお知らせ。--json なら JSON で（標準出力には混ぜません） */
+static void say_notice(int json, const char *text) {
+    if (json) {
+        fputs("{\"kind\":\"notice\",\"text\":", stderr);
+        put_json_str(text);
+        fputs("}\n", stderr);
+    } else {
+        fprintf(stderr, "お知らせ: %s\n", text);
+    }
+}
+
+/*
+ * --json のときの失敗の出し方。1 行 1 つの JSON で、標準エラーへ出します。
+ * ★本体の yui_exec_json は結果だけを JSON にします。失敗の理由は
+ *   yui_errmsg() が返す人向けの文なので、包むのは呼ぶ側（ここ）の仕事です。
+ * ★包む相手は結の出した文ですが、その中に利用者が書いた名前が入ります。
+ *   引用符や改行が混ざっても壊れないように、ここで逃がします。
+ */
+static void print_json_err(unsigned long lineno, const char *text) {
+    fputs("{\"kind\":\"error\"", stderr);
+    if (lineno) fprintf(stderr, ",\"line\":%lu", lineno);
+    fputs(",\"text\":", stderr);
+    put_json_str(text);
+    fputs("}\n", stderr);
 }
 
 /*
@@ -184,9 +202,10 @@ int main(int argc, char **argv) {
         yui_close(db);
         return 1;
     }
-    /* ★お知らせは、--json でも人向けの文のまま標準エラーへ出します。
-     *   結果（標準出力）に混ぜないので、機械で読む側の邪魔にはなりません。 */
-    if (yui_notice(db)) fprintf(stderr, "お知らせ: %s\n", yui_notice(db));
+    /* ★お知らせは標準エラーへ出します。結果（標準出力）に混ぜないので、
+     *   `yui --json … | jq` の邪魔にはなりません。
+     *   --json のときは、お知らせも JSON にします（2>&1 でまとめる人がいるため）。 */
+    if (yui_notice(db)) say_notice(json, yui_notice(db));
     if (query) {
         rc = json ? yui_exec_json(db, query, print_row, NULL)
                   : yui_exec(db, query, print_row, NULL);

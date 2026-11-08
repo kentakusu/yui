@@ -129,6 +129,51 @@ jobs:
           if ($left -notmatch "点:乙") { throw "NUL の次の行が巻き込まれています: $left" }
           Write-Host "CLI: 通りました"
 
+      # ★入れ替え（rename）で失敗する道。ここでしか起こせません。
+      #   Windows は「行き先を他のプロセスが掴んでいると置き換えられない」ので、
+      #   削除を許さない形で開いたまま 詰め直す を打つと、入れ替えの段で失敗します。
+      #   POSIX では、置き場を書けなくすると作業用のファイルを作る段で先に止まるため、
+      #   入れ替えの段まで行けません（tests/cli.sh はそこまでを見ています）。
+      - name: 詰め直す が入れ替えで失敗したとき、元のファイルが残ること
+        shell: pwsh
+        run: |
+          [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+          # ★ファイルを 2 つに分けます。1 つで両方 見ようとすると、
+          #   同じプロセスの試しで書いたぶんが md5 の比較に混ざります（実測で踏みました）。
+          #   また Get-FileHash は共有の指定が厳しいので、掴んでいる間は読めません。
+          function 掴んで詰め直す($path, $stdin) {
+            $h = [IO.File]::Open((Join-Path $PWD $path), 'Open', 'ReadWrite', 'ReadWrite')
+            try {
+              if ($stdin) { return (Get-Content $stdin -Raw | .\yui.exe $path) 2>&1 | Out-String }
+              return (.\yui.exe $path "詰め直す") 2>&1 | Out-String
+            } finally { $h.Close() }
+          }
+          foreach ($f in @("a.yui", "b.yui")) {
+            .\yui.exe $f "作る (人:田中)" | Out-Null
+            .\yui.exe $f "作る (人:佐藤)" | Out-Null
+            .\yui.exe $f "消す (人:佐藤)" | Out-Null
+          }
+          # (1) 失敗しても元のファイルが残り、作業用の .詰 も残らないこと
+          $before = (Get-FileHash a.yui -Algorithm MD5).Hash
+          $err = 掴んで詰め直す "a.yui" $null
+          $rc = $LASTEXITCODE
+          if ($rc -ne 1) { throw "入れ替えの失敗で 1 を返しません（rc=$rc）" }
+          if ($err -notmatch "入れ替えられません") { throw "入れ替えられないと言いません: $err" }
+          if (Test-Path "a.yui.詰") { throw "作業用の .詰 が残っています" }
+          if ($before -ne (Get-FileHash a.yui -Algorithm MD5).Hash) {
+            throw "失敗したのに元のファイルが変わりました"
+          }
+          # (2) ★同じプロセスの中でも立て直せること。別のプロセスで見ると、
+          #     次のプロセスが開き直すので、立て直しを壊しても通ってしまいます。
+          "詰め直す`n一覧 (人:) 名前だけ`n作る (人:鈴木)" |
+            Set-Content -Path bin.txt -Encoding utf8NoBOM
+          $same = 掴んで詰め直す "b.yui" "bin.txt"
+          if ($same -notmatch "人:田中") { throw "同じプロセスで失敗のあと読めません: $same" }
+          if ($same -notmatch "人:鈴木") { throw "同じプロセスで失敗のあと書けません: $same" }
+          $left = (.\yui.exe b.yui "一覧 (人:) 名前だけ" | Out-String)
+          if ($left -notmatch "人:鈴木") { throw "書いたものが残っていません: $left" }
+          Write-Host "詰め直す の入れ替えの失敗: 通りました"
+
       - name: 土台をまたぐ比較用のファイルを作る
         run: type tests\compat.txt | .\yui.exe compat.yui
 

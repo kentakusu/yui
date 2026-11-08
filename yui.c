@@ -2586,7 +2586,15 @@ static int exec_stmt(P *p) {
 static int exec_all(yui *db, const char *query, yui_cb cb, void *ctx, int json) {
     P p;
     int rc = YUI_OK;
-    if (!db || db->fd < 0) return YUI_ERROR;
+    if (!db) return YUI_ERROR;
+    if (db->fd < 0) {
+        /* ★前の失敗の文を返さずに、いまの状態を言います。
+         *   閉じたままのときに前の理由を返すと、2 行目以降が
+         *   「入れ替えられません」のまま並び、何が起きているか読めません
+         *   （陽性対照を取っていて気づきました）。 */
+        set_err(db, "ファイルが開かれていません");
+        return YUI_ERROR;
+    }
     db->json = json;
     free(db->err);
     db->err = NULL;
@@ -2751,10 +2759,24 @@ static int load_file(yui *db) {
         return -1;
     }
     if (st.st_size == 0) {
+        char b[512];
         if (write_all(db->fd, MAGIC, MAGIC_LEN) != 0) {
             set_err(db, "書けません: %s", strerror(errno));
             return -1;
         }
+        /*
+         * ★中身が無かったことを知らせます。
+         *   結は無いファイルを作って開きます。それは便利ですが、
+         *   **置き場を取り違えたときに「0 件」と同じ見た目になります**。
+         *   実際に、作業場所を間違えて 探す を打ち、空のファイルが新しくできて
+         *   「0 件」が返り、grep の件数と合わないので気づいた人がいます。
+         *   合わせる相手が無ければ気づけないので、こちらから言います。
+         *   エラーにはしません（作って開くのは正しい振る舞いなので）。
+         */
+        snprintf(b, sizeof b, "新しいファイルとして始めました: %s（中身がありませんでした）",
+                 db->path);
+        free(db->notice);
+        db->notice = xstrdup(b);
         db->size = MAGIC_LEN;
         return 0;
     }
