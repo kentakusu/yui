@@ -13,11 +13,20 @@
  *
  * 識別子は本体と同じく ASCII です（日本語の識別子は古い C コンパイラで通りません）。
  */
+/*
+ * ★clock_gettime を使うためにこれが要ります（本体の yui.c と同じ形）。
+ *   書かないと、暗黙の宣言として通ってしまい、返り値が int になります。
+ *   ★ヘッダより前に置くこと（あとでは効きません）。
+ */
+#define _DEFAULT_SOURCE 1
+#define _DARWIN_C_SOURCE 1
+
 #include "../yui.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #ifdef _WIN32
 /*
@@ -35,6 +44,20 @@
 #undef far
 #include <fcntl.h>
 #include <io.h>
+#endif
+
+/*
+ * ★経った時間をミリ秒で測るためだけの時計。clock() は CPU 時間なので
+ *   眠っている間は進まず、「待ち時間」の測定には使えません。
+ */
+#ifdef _WIN32
+static unsigned long long now_ms(void) { return (unsigned long long)GetTickCount64(); }
+#else
+static unsigned long long now_ms(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
+    return (unsigned long long)ts.tv_sec * 1000u + (unsigned long long)(ts.tv_nsec / 1000000L);
+}
 #endif
 
 #define TMP     "yui_test_tmp.yui"
@@ -987,6 +1010,33 @@ static void lock_tests(void) {
         ok("下ごしらえ（先に錠を取る）", 0, yui_errmsg(db));
     }
     yui_close(db);
+    /*
+     * 15. ★待つ上限が守られること（時間を測る検査）
+     *   ★これを「眠ったつもりの計」で持っていたとき、macOS で
+     *   --wait 1/2/3 が 1.9/3.4/4.8 秒 になっていました（使っている人の実測）。
+     *   土台の眠りが伸びるので、足し算では守れません。
+     *   ★上限は 3000 ms としています（2000 に対して 1000 ms の余裕）。
+     *     足し算の形で macOS が出した 3428 ms はこれを越えます。
+     *   ★下限も見ます。見ないと、**すえを課める実装**がこの検査を通ります。
+     */
+    {
+        yui *holder = NULL, *late = NULL;
+        unsigned long long t0, dt;
+        char buf[80];
+        if (yui_open_locked(TMP, "上限の試験", 0, &holder) == YUI_OK) {
+            t0 = now_ms();
+            ok("待っても取れなければ断ること",
+               yui_open_full(TMP, "あとから", 0, 2000, &late) == YUI_ERROR, NULL);
+            dt = now_ms() - t0;
+            sprintf(buf, "%lu ms 待ちました", (unsigned long)dt);
+            ok("★上限までは待つこと（1900 ms 以上）", dt >= 1900, buf);
+            ok("★上限を大きく超えないこと（3000 ms 未満）", dt < 3000, buf);
+            yui_close(late);
+        } else {
+            ok("下ごしらえ（先に錠を取る）", 0, yui_errmsg(holder));
+        }
+        yui_close(holder);
+    }
     {
         /* ★錠でない失敗では 0。ここが 1 なら、見分けたことにならない */
         yui *b3 = NULL;

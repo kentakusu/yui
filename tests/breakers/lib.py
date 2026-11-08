@@ -19,6 +19,21 @@ RUNDIR = "/tmp/yui_pc_run"
 
 BREAKS = [
     (
+        # ★土台の眠りが伸びるときだけ嘘になる形。Linux の nanosleep は正確なので、
+        # ★**偽の macOS を作らないとこの検査の検出力を示せません。**
+        #   眠りを 140 ms 伸ばすだけでは落ちません（時計を読む形が守るため）。
+        #   眠ったつもりを足し算する形に戻して、初めて落ちます。
+        "待ち時間を足し算で数える（偽の macOS: 眠りが毎回 140 ms 伸びる）",
+        [
+            ("    (void)nanosleep(&ts, NULL);",
+             "    ts.tv_nsec += 140000000L; if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }\n    (void)nanosleep(&ts, NULL);"),
+            ("""static int next_nap(u64 deadline, int *step) {\n    u64 t = now_ms(), left;\n    int s;\n    if (t >= deadline) return 0;\n    left = deadline - t;""",
+             """static int next_nap(u64 deadline, int *step) {\n    static u64 slept = 0; u64 left;\n    int s;\n    if (slept >= 2000) { slept = 0; return 0; }\n    left = 2000 - slept;\n    (void)deadline;"""),
+            ("    if (s <= 0) return 0;\n    if (*step < 200) *step *= 2;",
+             "    if (s <= 0) return 0;\n    slept += (u64)s;\n    if (*step < 200) *step *= 2;"),
+        ],
+    ),
+    (
         "閉じても錠を消さない",
         [("        remove(db->lockpath);", "        /* わざと壊した */;")],
     ),

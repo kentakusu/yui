@@ -3208,13 +3208,41 @@ static void nap_ms(int ms) {
  * ★flock の LOCK_NB を外して待つ形にはしません。それだと待ち時間に上限を
  *   作れず、いつまでも返ってこない道ができます。少しずつ間を広げて試します。
  */
-static int next_nap(int wait_ms, int *slept, int *step) {
+/*
+ * 現在時刻をミリ秒で返します（時刻ではなく、経った時間を測るためのもの）。
+ * ★差を取るのにしか使いません。起点は土台で違います。
+ */
+static u64 now_ms(void) {
+#ifdef _WIN32
+    return (u64)GetTickCount64();
+#else
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
+    return (u64)ts.tv_sec * 1000u + (u64)(ts.tv_nsec / 1000000L);
+#endif
+}
+
+/*
+ * 次に何ミリ秒 眠るかを返します。0 なら、もう課めるときです。
+ *
+ * ★**眠ったつもりの計を足し算で持ってはいけません。**
+ *   眠りは頼んだだけ眠るとは限らず、伸びる土台があります。
+ *   足し算だったとき、macOS で --wait 1/2/3 が 1.9/3.4/4.8 秒 でした
+ *   （使っている人の実測。1 回の眠りごとに約 140 ms 余分にかかり、
+ *   上限が長いほど眠る回数が増えるので、超過も増えていきました）。
+ * ★**それで、時計を読み直して残りを求める形にしました。**
+ *   こうしておけば、**眠りが伸びても、flock が遅くても、輪の中で何が起きても**
+ *   上限で止まります。土台ごとの係数で補正する形にはしません
+ *   （伸び方は一定でないので、補正は別の土台で外れます）。
+ */
+static int next_nap(u64 deadline, int *step) {
+    u64 t = now_ms(), left;
     int s;
-    if (*slept >= wait_ms) return 0;
+    if (t >= deadline) return 0;
+    left = deadline - t;
     s = *step;
-    if (s > wait_ms - *slept) s = wait_ms - *slept;
+    if ((u64)s > left) s = (int)left;
     if (s <= 0) return 0;
-    *slept += s;
     if (*step < 200) *step *= 2; /* だんだん間を広げます */
     return s;
 }
@@ -3350,14 +3378,15 @@ static yui *db_new(yui **out) {
  */
 static int open_body(yui *db, int wait_ms) {
     int op = db->shared ? LOCK_SH : LOCK_EX;
-    int slept = 0, step = 20, nap;
+    int step = 20, nap;
+    u64 deadline = now_ms() + (u64)wait_ms;
     db->fd = open(db->path, O_RDWR | O_CREAT, 0644);
     if (db->fd < 0) {
         set_err(db, "開けません: %s: %s", db->path, strerror(errno));
         return YUI_ERROR;
     }
     while (flock(db->fd, op | LOCK_NB) != 0) {
-        nap = next_nap(wait_ms, &slept, &step);
+        nap = next_nap(deadline, &step);
         if (!nap) {
             set_err(db, "別のところで開かれています: %s", db->path);
             db->busy = 1; /* あとで試せば通るかもしれない失敗です */
@@ -3379,13 +3408,15 @@ int yui_open_full(const char *path, const char *name, int flags, int wait_ms, yu
     char got[LOCK_READ_MAX];
     char want[32];
     u64 tag;
-    int rc, slept = 0, step = 20, nap;
+    int rc, step = 20, nap;
+    u64 deadline;
 
     if (!path || !*path) {
         set_err(db, "ファイル名がありません");
         return YUI_ERROR;
     }
     if (wait_ms < 0) wait_ms = 0;
+    deadline = now_ms() + (u64)wait_ms;
     db->path = xstrdup(path);
     db->readonly = (flags & YUI_READONLY) ? 1 : 0;
     db->shared = (flags & YUI_SHARED) ? 1 : 0;
@@ -3417,7 +3448,7 @@ int yui_open_full(const char *path, const char *name, int flags, int wait_ms, yu
     for (;;) {
         rc = lock_take(db, lpath, name, tag);
         if (rc != 1) break;
-        nap = next_nap(wait_ms, &slept, &step);
+        nap = next_nap(deadline, &step);
         if (!nap) break;
         nap_ms(nap);
     }
