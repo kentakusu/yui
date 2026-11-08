@@ -49,7 +49,8 @@
 typedef long long ssize_t;
 #endif
 
-/* flock の種類。本体が使うのはこの 2 つだけです。 */
+/* flock の種類。本体が使うのはこの 3 つだけです。 */
+#define LOCK_SH 1
 #define LOCK_EX 2
 #define LOCK_NB 4
 
@@ -157,11 +158,13 @@ static int yui_win_ftruncate(int fd, long long len) {
 static int yui_win_flock(int fd, int op) {
     HANDLE h = (HANDLE)_get_osfhandle(fd);
     OVERLAPPED ov;
-    DWORD flags = LOCKFILE_EXCLUSIVE_LOCK;
+    DWORD flags = 0;
     if (h == INVALID_HANDLE_VALUE) {
         errno = EBADF;
         return -1;
     }
+    /* ★LOCK_SH は「印を付けない」ことで表します（LockFileEx の既定が共有） */
+    if (op & LOCK_EX) flags |= LOCKFILE_EXCLUSIVE_LOCK;
     if (op & LOCK_NB) flags |= LOCKFILE_FAIL_IMMEDIATELY;
     memset(&ov, 0, sizeof ov);
     if (!LockFileEx(h, flags, 0, 0xFFFFFFFFu, 0xFFFFFFFFu, &ov)) {

@@ -349,6 +349,7 @@ struct yui {
     void *ctx;
     int stopped;
     int readonly; /* 1 なら書き込む言葉を断る（YUI_READONLY で開いたとき） */
+    int shared;   /* 1 なら錠を共有で取る（読む人どうしは待たない） */
     int json;     /* 1 なら 1 行 1 つの JSON で出す（yui_exec_json） */
     int in_replay;
 };
@@ -1383,8 +1384,9 @@ static void emit_str(yui *db, Str *o) {
     str_clear(o);
 }
 static void emit_count(yui *db, size_t n, const char *suffix) {
-    /* ★手がかり（label_hint）を添えることがあるので、短い桁では足りません */
-    char b[256];
+    /* ★手がかり（label_hint や 辿る の [?]）を添えることがあるので、
+     *   短い桁では足りません。日本語は 1 文字 3 バイトです。 */
+    char b[512];
     snprintf(b, sizeof b, "%llu 件%s", (unsigned long long)n, suffix);
     if (!db->json) {
         emit(db, YUI_SUMMARY, b);
@@ -2361,7 +2363,23 @@ static int cmd_walk(P *p) {
     free(starts.v);
     free(queue.v);
     free(o.p);
-    emit_count(db, count, "");
+    /*
+     * ★0 件 のときだけ、線の種類が「?」で始まっていないか見ます。
+     *   点の側の (?何) は「何でもよい」の印ですが、**線の側に変数はありません**。
+     *   [?] は「種類が『?』という名前の線」を探してしまい、0 件で黙ります。
+     *   実際に利用者が踏みました（点の側と同じだと思って打った）。
+     *   探す がラベルで同じことをしているので、並びとしても自然です。
+     */
+    if (count == 0 && e.type && e.type[0] == '?') {
+        /* ★日本語の文面は 1 文字 3 バイトなので、桁を小さく見積もると切れます
+         *   （160 バイトで組んだら -O2 の gcc が切り詰めの警告を出しました） */
+        char h[256];
+        snprintf(h, sizeof h, "（「[%.40s]」は種類が「%.40s」の線です。種類を問わないなら [] です）",
+                 e.type, e.type);
+        emit_count(db, count, h);
+    } else {
+        emit_count(db, count, "");
+    }
     return 0;
 }
 
@@ -3129,6 +3147,36 @@ static void lock_clean(const char *src, char *buf, size_t n) {
  *   「自分の印が入っている」を見てしまいます（実測で見つかりました）。
  *   そこで、秒より細かい時計と乱数を混ぜます。
  */
+/*
+ * 少し眠る。★C99 に眠る関数が無いので、土台ごとに用意します。
+ */
+static void nap_ms(int ms) {
+#ifdef _WIN32
+    Sleep((DWORD)ms);
+#else
+    struct timespec ts;
+    ts.tv_sec = ms / 1000;
+    ts.tv_nsec = (long)(ms % 1000) * 1000000L;
+    (void)nanosleep(&ts, NULL);
+#endif
+}
+
+/*
+ * 次に待つ長さを返します（0 なら、もう待たない）。
+ * ★flock の LOCK_NB を外して待つ形にはしません。それだと待ち時間に上限を
+ *   作れず、いつまでも返ってこない道ができます。少しずつ間を広げて試します。
+ */
+static int next_nap(int wait_ms, int *slept, int *step) {
+    int s;
+    if (*slept >= wait_ms) return 0;
+    s = *step;
+    if (s > wait_ms - *slept) s = wait_ms - *slept;
+    if (s <= 0) return 0;
+    *slept += s;
+    if (*step < 200) *step *= 2; /* だんだん間を広げます */
+    return s;
+}
+
 static u64 lock_tag(void) {
     static u64 seq = 0;
     u64 t = (u64)time(NULL);
@@ -3253,16 +3301,26 @@ static yui *db_new(yui **out) {
     return db;
 }
 
-/* db->path を開いて flock して読み込みます */
-static int open_body(yui *db) {
+/*
+ * db->path を開いて flock して読み込みます。
+ * wait_ms まで待ってから諦めます（0 なら待ちません）。
+ * db->shared なら共有の錠を取るので、読む人どうしは待ち合いません。
+ */
+static int open_body(yui *db, int wait_ms) {
+    int op = db->shared ? LOCK_SH : LOCK_EX;
+    int slept = 0, step = 20, nap;
     db->fd = open(db->path, O_RDWR | O_CREAT, 0644);
     if (db->fd < 0) {
         set_err(db, "開けません: %s: %s", db->path, strerror(errno));
         return YUI_ERROR;
     }
-    if (flock(db->fd, LOCK_EX | LOCK_NB) != 0) {
-        set_err(db, "別のところで開かれています: %s", db->path);
-        goto fail;
+    while (flock(db->fd, op | LOCK_NB) != 0) {
+        nap = next_nap(wait_ms, &slept, &step);
+        if (!nap) {
+            set_err(db, "別のところで開かれています: %s", db->path);
+            goto fail;
+        }
+        nap_ms(nap);
     }
     if (load_file(db) != 0) goto fail;
     return YUI_OK;
@@ -3272,20 +3330,38 @@ fail:
     return YUI_ERROR;
 }
 
-int yui_open_locked(const char *path, const char *name, int flags, yui **out) {
+int yui_open_full(const char *path, const char *name, int flags, int wait_ms, yui **out) {
     yui *db = db_new(out);
     char *lpath;
     char got[LOCK_READ_MAX];
     char want[32];
     u64 tag;
-    int rc;
+    int rc, slept = 0, step = 20, nap;
 
     if (!path || !*path) {
         set_err(db, "ファイル名がありません");
         return YUI_ERROR;
     }
+    if (wait_ms < 0) wait_ms = 0;
     db->path = xstrdup(path);
     db->readonly = (flags & YUI_READONLY) ? 1 : 0;
+    db->shared = (flags & YUI_SHARED) ? 1 : 0;
+
+    /*
+     * ★共有で開くなら、読むだけでなければいけません。
+     *   共有の錠を持ったまま書くと、同時に読んでいる人が壊れたものを読みます。
+     */
+    if (db->shared && !db->readonly) {
+        set_err(db, "共有で開くなら、読むだけ（YUI_READONLY）も付けてください");
+        return YUI_ERROR;
+    }
+
+    /*
+     * ★<パス>.錠 を使わない道が 2 つあります。
+     *   ・YUI_NO_LOCKFILE … 呼ぶ側が外した（短命なプロセスなど。下記）
+     *   ・YUI_SHARED      … 共有で開く人が、排他の錠を取るのはおかしいので
+     */
+    if ((flags & YUI_NO_LOCKFILE) || db->shared) return open_body(db, wait_ms);
 
     /*
      * ★錠を flock より先に当てます。順番が逆だと、同じ土台どうしの衝突が
@@ -3294,7 +3370,14 @@ int yui_open_locked(const char *path, const char *name, int flags, yui **out) {
      */
     lpath = lock_path_of(path);
     tag = lock_tag();
-    rc = lock_take(db, lpath, name, tag);
+    /* 塞がれていたら、wait_ms まで待って試し直します */
+    for (;;) {
+        rc = lock_take(db, lpath, name, tag);
+        if (rc != 1) break;
+        nap = next_nap(wait_ms, &slept, &step);
+        if (!nap) break;
+        nap_ms(nap);
+    }
 
     if (rc == 1 && (flags & YUI_LOCK_BREAK)) {
         /*
@@ -3328,17 +3411,15 @@ int yui_open_locked(const char *path, const char *name, int flags, yui **out) {
 
     /* ★ここから先で失敗しても、yui_close が錠を外します */
     db->lockpath = lpath;
-    return open_body(db);
+    return open_body(db, wait_ms);
 }
 
+/* 下の 2 つは yui_open_full の短い書き方です（中身は 1 つだけ） */
+int yui_open_locked(const char *path, const char *name, int flags, yui **out) {
+    return yui_open_full(path, name, flags, 0, out);
+}
 int yui_open(const char *path, yui **out) {
-    yui *db = db_new(out);
-    if (!path || !*path) {
-        set_err(db, "ファイル名がありません");
-        return YUI_ERROR;
-    }
-    db->path = xstrdup(path);
-    return open_body(db);
+    return yui_open_full(path, NULL, YUI_NO_LOCKFILE, 0, out);
 }
 
 const char *yui_errmsg(yui *db) {

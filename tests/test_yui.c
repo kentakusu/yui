@@ -943,7 +943,24 @@ static void lock_tests(void) {
     }
     yui_close(db);
 
-    /* 11. ★既定 off。ふつうに開いたら錠を作らない */
+    /* 11. 共有で開くなら、読むだけでなければいけない
+     *    ★共有の錠を持ったまま書くと、同時に読んでいる人が壊れたものを読みます。 */
+    ok("共有だけでは開けないこと", yui_open_full(TMP, "共有の試験", YUI_SHARED, 0, &db) == YUI_ERROR,
+       NULL);
+    ok("その理由を言うこと", starts(yui_errmsg(db), "共有で開くなら"), yui_errmsg(db));
+    yui_close(db);
+
+    /* 12. 共有で開く人は、排他の錠（<パス>.錠）を取らない */
+    if (yui_open_full(TMP, "共有の試験", YUI_READONLY | YUI_SHARED, 0, &db) == YUI_OK) {
+        ok("共有で開くと錠のファイルを作らないこと", !file_exists(TMPLOCK), NULL);
+        ok("共有でも読めること", yui_exec(db, "一覧 (人:)", NULL, NULL) == YUI_OK, yui_errmsg(db));
+        ok("共有でも書けないこと", yui_exec(db, "作る (人:新顔)", NULL, NULL) == YUI_ERROR, NULL);
+    } else {
+        ok("下ごしらえ（共有で開く）", 0, yui_errmsg(db));
+    }
+    yui_close(db);
+
+    /* 13. ★既定 off。ふつうに開いたら錠を作らない */
     if (yui_open(TMP, &db) == YUI_OK)
         ok("ふつうに開くと錠を作らないこと", !file_exists(TMPLOCK), NULL);
     else

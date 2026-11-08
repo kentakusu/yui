@@ -3,6 +3,8 @@
  *   yui ファイル                対話（端末でなければ、標準入力を 1 行ずつ実行）
  *   yui ファイル "問い合わせ"     1 回だけ実行
  *   yui --json …                1 行を 1 つの JSON で出す（機械で読むとき）
+ *   yui --read …                読むだけで開く（★何本でも同時に読めます）
+ *   yui --wait 30 …             塞がれていたら 30 秒 まで待つ
  * 失敗があれば終了コードは 1 です。
  */
 #define _POSIX_C_SOURCE 200809L
@@ -127,8 +129,8 @@ static void say_err(int json, unsigned long lineno, const char *text) {
 
 int main(int argc, char **argv) {
     yui *db;
-    int failed = 0, tty, rc, json = 0, ai = 1;
-    const char *path, *query = NULL;
+    int failed = 0, tty, rc, json = 0, ai = 1, readonly = 0, wait_s = 0;
+    const char *path = NULL, *query = NULL;
     char *line;
 #ifdef _WIN32
     {
@@ -140,17 +142,48 @@ int main(int argc, char **argv) {
         }
     }
 #endif
-    if (argc > 1 && strcmp(argv[1], "--json") == 0) {
-        json = 1;
-        ai = 2;
+    for (ai = 1; ai < argc; ai++) {
+        if (strcmp(argv[ai], "--json") == 0) {
+            json = 1;
+        } else if (strcmp(argv[ai], "--read") == 0) {
+            readonly = 1;
+        } else if (strcmp(argv[ai], "--wait") == 0 && ai + 1 < argc) {
+            wait_s = atoi(argv[++ai]);
+        } else if (strncmp(argv[ai], "--", 2) == 0) {
+            /* ★知らない旗は断ります。通すと、綴り違いがファイル名として
+             *   扱われ、「--jsn」という名前の新しいファイルが黙って作られます。 */
+            fprintf(stderr, "知らない旗です: %s\n", argv[ai]);
+            path = NULL;
+            break;
+        } else if (!path) {
+            path = argv[ai];
+        } else if (!query) {
+            query = argv[ai];
+        } else {
+            fprintf(stderr, "引数が多すぎます: %s\n", argv[ai]);
+            path = NULL;
+            break;
+        }
     }
-    if (argc - ai < 1 || argc - ai > 2) {
-        fprintf(stderr, "使い方: %s [--json] ファイル [問い合わせ]\n", argv[0]);
+    if (!path || wait_s < 0) {
+        fprintf(stderr,
+                "使い方: %s [--json] [--read] [--wait 秒] ファイル [問い合わせ]\n"
+                "  --read      読むだけで開く。★何本でも同時に読めます（書く人だけが待ちます）\n"
+                "  --wait 秒   塞がれていたら、その秒数まで待ちます\n"
+                "  問い合わせを -- で始めることはできません（旗と見分けが付かないので）\n",
+                argv[0]);
         return 2;
     }
-    path = argv[ai];
-    if (argc - ai == 2) query = argv[ai + 1];
-    if (yui_open(path, &db) != YUI_OK) {
+    if (wait_s > 3600) wait_s = 3600; /* 1 時間で足ります（掛け算が溢れないように） */
+    /*
+     * ★<パス>.錠 は使いません（YUI_NO_LOCKFILE）。錠は落ちても外れないので、
+     *   1 日に何百回も起動する CLI が途中で落ちると、残骸が全員を止めます。
+     *   flock なら落ちれば外れます。土台をまたいで使うものは、
+     *   埋め込み側で yui_open_locked を使ってください（yui.h）。
+     */
+    if (yui_open_full(path, NULL,
+                      YUI_NO_LOCKFILE | (readonly ? (YUI_READONLY | YUI_SHARED) : 0),
+                      wait_s * 1000, &db) != YUI_OK) {
         say_err(json, 0, yui_errmsg(db));
         yui_close(db);
         return 1;

@@ -53,9 +53,11 @@ typedef int (*yui_cb)(void *ctx, int kind, const char *text);
  */
 int yui_open(const char *path, yui **db);
 
-/* yui_open_locked の旗（足し合わせて渡せます） */
-#define YUI_LOCK_BREAK 1 /* 塞がれていたら壊して取る */
-#define YUI_READONLY   2 /* 書き込む言葉（作る 結ぶ 消す 詰め直す）を断る */
+/* 開くときの旗（足し合わせて渡せます） */
+#define YUI_LOCK_BREAK  1 /* 塞がれていたら壊して取る */
+#define YUI_READONLY    2 /* 書き込む言葉（作る 結ぶ 消す 詰め直す）を断る */
+#define YUI_SHARED      4 /* 錠を共有で取る。★YUI_READONLY と一緒に使います */
+#define YUI_NO_LOCKFILE 8 /* <パス>.錠 を使わない（flock だけ） */
 
 /*
  * yui_open と同じですが、`<パス>.錠` も取ります。
@@ -111,6 +113,30 @@ int yui_open_locked(const char *path, const char *name, int flags, yui **db);
  * ★項目は増えることがあります。知らないキーは読み飛ばしてください。
  */
 int yui_lock_owner(const char *path, char *buf, size_t bufn);
+
+/*
+ * 開き方を全部 指定する形。★上の 2 つはこれの短い書き方で、中身は 1 つだけです。
+ *
+ *   yui_open(path, db)                   = yui_open_full(path, NULL, YUI_NO_LOCKFILE, 0, db)
+ *   yui_open_locked(path, name, f, db)   = yui_open_full(path, name, f, 0, db)
+ *
+ * wait_ms … 塞がれていたとき、この長さまで待ってから諦めます（0 なら待ちません）。
+ *   ★待っている間は返りません。使う側の持ち時間に収まる長さにしてください。
+ *   ★待ち時間に上限を作るため、少しずつ間を広げて試し直す形です
+ *     （flock を待つ形にすると上限が作れません）。
+ *
+ * ★**同時に何本も読みたいときは YUI_READONLY | YUI_SHARED です。**
+ *   共有の錠になるので、**読む人どうしは待ち合いません**（書く人だけが待ちます）。
+ *   読んでいる間は誰も書けないので、古い中身が返ることはありません。
+ *   このとき `<パス>.錠` は使いません（共有で開く人が排他の錠を取るのは誤りなので）。
+ *   ★YUI_SHARED を YUI_READONLY なしで渡すと断ります。
+ *   ★wasm では flock が何もしないので、共有も排他も効きません。
+ *
+ * ★**短命なプロセス（CLI のような）では YUI_NO_LOCKFILE を薦めます。**
+ *   `<パス>.錠` は落ちても外れないので、1 日に何百回も起動するものが
+ *   途中で落ちると、残骸が全員を止めます。flock は落ちれば外れます。
+ */
+int yui_open_full(const char *path, const char *name, int flags, int wait_ms, yui **db);
 
 /*
  * 問い合わせを実行します。cb は NULL でも構いません。
