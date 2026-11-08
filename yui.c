@@ -2442,12 +2442,22 @@ static int cmd_list(P *p) {
     return 0;
 }
 
+/*
+ * ★「消しました」と言うときに、中身がファイルに残ることを同じ行で言います。
+ *   記録は追記しかしないので、消すのは「消した」という記録を足すことです。
+ *   ★これを言わないと、誤って秘匿のものを書いた人が「消えた」と読んで、
+ *     そこで手を止めます（利用者からの指摘）。
+ *     読んだ人が何をしなくなるかで危険度が決まるので、文面に入れます。
+ */
+#define DEL_NOTE "（中身はファイルに残ります。落とすには 詰め直す）"
+
 static int cmd_delete(P *p) {
     yui *db = p->db;
     NodePat a, b;
     EdgePat e;
     u64 ia, ib;
-    char msg[120];
+    /* ★日本語は 1 文字 3 バイト。DEL_NOTE を足したら 120 では切れました */
+    char msg[256];
     if (parse_node(p, &a, 0) != 0) return -1;
     {
         int len, s;
@@ -2484,7 +2494,7 @@ static int cmd_delete(P *p) {
                 return 0;
             }
             if (del_record(db, R_DEL_EDGE, en->val) != 0) return -1;
-            emit(db, YUI_SUMMARY, "線を 1 本 消しました");
+            emit(db, YUI_SUMMARY, "線を 1 本 消しました" DEL_NOTE);
             return 0;
         }
     }
@@ -2503,7 +2513,7 @@ static int cmd_delete(P *p) {
             if (ed->live && ed->from != ed->to) ne++;
         }
         if (del_record(db, R_DEL_NODE, ia) != 0) return -1;
-        snprintf(msg, sizeof msg, "点を 1 件と、つながる線を %llu 本 消しました",
+        snprintf(msg, sizeof msg, "点を 1 件と、つながる線を %llu 本 消しました" DEL_NOTE,
                  (unsigned long long)ne);
         emit(db, YUI_SUMMARY, msg);
     }
