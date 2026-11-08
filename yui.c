@@ -75,31 +75,18 @@ static void vec_sort_unique(Vec *a) {
 }
 
 /*
- * 索引の中だけで使う、4 バイトの並び。
+ * 索引が持つ文書番号の上限。
  *
  * ★索引は「どの文書にその 2〜3 文字の並びが在るか」を文書番号で持ちます。
  *   数がいちばん多いのがここなので、8 バイトではなく 4 バイトで持ちます
- *   （本文のある点が何万もあると、索引がメモリの 4 割ほどを占めます。
+ *   （本文のある点が何万もあると、索引がメモリの大半を占めます。
  *   README の「何にメモリを使っているか」を見てください）。
  * ★文書番号は doc = id << 1 | 線なら 1 なので、4 バイトに収まるのは
  *   id が 2^31-1 までです。1 点に最低でも数百バイト要るので、そこへ届く前に
  *   メモリが尽きますが、黙って切り捨てると「探しても出てこない」に化けるため、
- *   点と線を作るところで断ります（MAX_ID）。
+ *   点と線を作るところで断ります。
  */
 #define MAX_ID 0x7fffffffu
-
-typedef struct {
-    u32 *v;
-    size_t n, cap;
-} Vec32;
-
-static void vec32_push(Vec32 *a, u32 x) {
-    if (a->n == a->cap) {
-        a->cap = a->cap ? a->cap * 2 : 4;
-        a->v = xrealloc(a->v, a->cap * sizeof(u32));
-    }
-    a->v[a->n++] = x;
-}
 
 typedef struct {
     char *p;
@@ -307,9 +294,30 @@ typedef struct {
     u32 mark;
 } Edge;
 
+/*
+ * 索引の枠 1 つ。key は 2〜3 文字の並び、中身はその並びを持つ文書番号です。
+ *
+ * ★2 件までは枠の中に直に持ちます（cap == 0 のとき u.few）。
+ *   実測（文字をばらけさせた 2.2MB のファイル・点 104）では、
+ *   並びの種類 118 万のうち **95% が 2 件以下**でした。
+ *   1 つずつ外に確保すると、1 種類あたり
+ *   「確保 1 回ぶんの負担（32 バイトほど）＋ 枠の丸め（4 件ぶん＝16 バイト）」
+ *   が乗ります。種類が 118 万あると、それだけで 50MB を超えます。
+ *   枠の中に持てば、その 95% は確保が 0 回です。
+ * ★3 件以上になったら外に出します（cap > 0 のとき u.v）。
+ *   どちらを使っているかは cap で分かります。読むときは slot_items を通してください。
+ * ★u.few を 2 件にしたのは、枠の大きさがこれで 24 バイトに収まるからです
+ *   （key 8 ＋ n 4 ＋ cap 4 ＋ 入れ物 8）。1 件にしても 24 バイトのままなので、
+ *   同じ大きさで 2 件 持てます。
+ */
 typedef struct {
     u64 key;
-    Vec32 list; /* 文書番号の並び。4 バイト（Vec32 の★を見よ） */
+    u32 n;   /* 入っている件数 */
+    u32 cap; /* 0 なら u.few、1 以上なら u.v の枠の数 */
+    union {
+        u32 few[2];
+        u32 *v;
+    } u;
 } GramSlot;
 
 struct yui {
@@ -510,10 +518,37 @@ static u64 gram3(u32 a, u32 b, u32 c) {
 static u64 gram2(u32 a, u32 b) {
     return (1ULL << 63) | ((u64)a << 21) | b;
 }
+/* 枠の中身。cap == 0 なら枠に直に入っている（GramSlot の★を見よ） */
+static u32 *slot_items(GramSlot *g) { return g->cap ? g->u.v : g->u.few; }
+
 static void gram_add(yui *db, u64 key, u64 doc) {
     GramSlot *g = gram_slot(db, key, 1);
     u32 d = (u32)doc; /* MAX_ID で収まることを確かめてある */
-    if (g->list.n == 0 || g->list.v[g->list.n - 1] != d) vec32_push(&g->list, d);
+    /* 同じ文書が続いたら 1 つにまとめます（同じ並びが本文に何度も出るため） */
+    if (g->n && slot_items(g)[g->n - 1] == d) return;
+    if (!g->cap) {
+        if (g->n < 2) {
+            g->u.few[g->n++] = d;
+            return;
+        }
+        /* 3 件目。ここで初めて外に出します */
+        {
+            u32 a = g->u.few[0], b = g->u.few[1], *v;
+            v = xmalloc(4 * sizeof *v);
+            v[0] = a;
+            v[1] = b;
+            v[2] = d;
+            g->u.v = v;
+            g->cap = 4;
+            g->n = 3;
+        }
+        return;
+    }
+    if (g->n == g->cap) {
+        g->cap *= 2;
+        g->u.v = xrealloc(g->u.v, g->cap * sizeof *g->u.v);
+    }
+    g->u.v[g->n++] = d;
 }
 static void index_text(yui *db, u64 doc, const char *s) {
     u32 *c;
@@ -565,20 +600,22 @@ static int doc_has(yui *db, u64 doc, const u32 *q, size_t qn) {
 static void search_docs(yui *db, const u32 *q, size_t qn, int use_index, Vec *out) {
     size_t i;
     if (qn >= 2 && use_index) {
-        const Vec32 *best = NULL;
+        GramSlot *best = NULL;
+        const u32 *items;
         if (qn == 2) {
             GramSlot *g = gram_slot(db, gram2(q[0], q[1]), 0);
             if (!g) return;
-            best = &g->list;
+            best = g;
         } else {
             for (i = 0; i + 2 < qn; i++) {
                 GramSlot *g = gram_slot(db, gram3(q[i], q[i + 1], q[i + 2]), 0);
                 if (!g) return; /* 1 つでも無ければ、どこにも無い */
-                if (!best || g->list.n < best->n) best = &g->list;
+                if (!best || g->n < best->n) best = g;
             }
         }
+        items = slot_items(best);
         for (i = 0; i < best->n; i++) {
-            u64 doc = best->v[i];
+            u64 doc = items[i];
             if (doc_has(db, doc, q, qn)) vec_push(out, doc);
         }
     } else {
@@ -660,7 +697,7 @@ static int apply_node(yui *db, u64 id, const char *label, const char *name, cons
     Node *x;
     if (id == db->nn + 1) {
         Str k = {0};
-        /* ★索引が文書番号を 4 バイトで持つので、ここが上限です（Vec32 の★）。
+        /* ★索引が文書番号を 4 バイトで持つので、ここが上限です（MAX_ID の★）。
          *   届く前にメモリが尽きますが、黙って切り捨てると
          *   「探しても出てこない」に化けるので断ります。 */
         if (id > MAX_ID) {
@@ -2605,7 +2642,9 @@ static void free_state(yui *db) {
     map_free(&db->m_name);
     map_free(&db->m_label);
     map_free(&db->m_edge);
-    for (i = 0; i < db->gramcap; i++) free(db->grams[i].list.v);
+    /* ★枠の中に直に入っているもの（cap == 0）は free しません。GramSlot の★を見よ */
+    for (i = 0; i < db->gramcap; i++)
+        if (db->grams[i].cap) free(db->grams[i].u.v);
     free(db->grams);
     arena_reset(&db->stmt);
     arena_reset(&db->scratch);
