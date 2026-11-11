@@ -43,7 +43,7 @@ BREAKS = [
         "読むだけで開かない（YUI_READONLY を外す）",
         [
             (
-                "if (yui_open_locked(path, name, YUI_READONLY, &db) != YUI_OK) {",
+                "if (yui_open_locked(path, name, writable ? 0 : YUI_READONLY, &db) != YUI_OK) {",
                 "if (yui_open_locked(path, name, 0, &db) != YUI_OK) {",
             )
         ],
@@ -109,9 +109,63 @@ BREAKS = [
         "錠を取らない（ファイルの持ち主にならない）",
         [
             (
-                "if (yui_open_locked(path, name, YUI_READONLY, &db) != YUI_OK) {",
+                "if (yui_open_locked(path, name, writable ? 0 : YUI_READONLY, &db) != YUI_OK) {",
                 "if (yui_open(path, &db) != YUI_OK) {",
             )
+        ],
+    ),
+    (
+        '名乗っていない接続にも書かせる',
+        [
+            (
+                'if (writable && yui_set_readonly(db, (c->me ? 0 : 1)) != YUI_OK) {',
+                'if (writable && yui_set_readonly(db, 0) != YUI_OK) {',
+            ),
+        ],
+    ),
+    (
+        "時刻を線でなく「機」の点の属性に置く（文書の例の形。上書きで消えます）",
+        [
+            (
+                '        buf_str(&q, "\\")-[書いた {時: \\"");\n        buf_str(&q, when);\n        buf_str(&q, "\\"}]->(機:\\"");\n        buf_stmt_str(&q, me); /* ★名乗りは生の文字列なので、ここで逃がします */\n        buf_str(&q, "\\")");',
+                '        buf_str(&q, "\\")-[書いた]->(機:\\"");\n        buf_stmt_str(&q, me);\n        buf_str(&q, "\\" {時: \\"");\n        buf_str(&q, when);\n        buf_str(&q, "\\"})");',
+            )
+        ],
+    ),
+    (
+        '往復できない名前にも黙って押す（別の点に付き、結ぶ が無い点を作ります）',
+        [
+            (
+                '        if (!stamp_safe(k->tgt[i].label) || !stamp_safe(k->tgt[i].name)) {',
+                '        if (0) {',
+            ),
+        ],
+    ),
+    (
+        '読む文でも押す（書き込みかどうかを見ない）',
+        [
+            (
+                '            if (yui_writes(db) > w0 && c->me && c->stamp) {',
+                '            if (c->me && c->stamp) {',
+            ),
+        ],
+    ),
+    (
+        '「印なし」を無視して押す',
+        [
+            (
+                '            if (yui_writes(db) > w0 && c->me && c->stamp) {',
+                '            if (yui_writes(db) > w0 && c->me) {',
+            ),
+        ],
+    ),
+    (
+        '押しきれなかったことを黙る',
+        [
+            (
+                '    if (k->tgt_over) {',
+                '    if (0) {',
+            ),
         ],
     ),
 ]

@@ -353,6 +353,12 @@ struct yui {
     int busy;     /* 1 なら「錠が取れなかった」。yui_busy() が返します */
     int json;     /* 1 なら 1 行 1 つの JSON で出す（yui_exec_json） */
     int in_replay;
+    /*
+     * ★書き込む言葉が通った回数。yui_writes() が返します。
+     *   デーモンが「いまの文は書き込みだったか」を知るためのものです。
+     *   締めの行の文面で見分ける作りにすると、文面を変えた日に黙って壊れます。
+     */
+    unsigned long writes;
 };
 
 static void set_err(yui *db, const char *fmt, ...) {
@@ -2639,6 +2645,8 @@ static int exec_stmt(P *p) {
     }
     rc = CMDS[i].fn(p);
     if (rc != 0) return YUI_ERROR;
+    /* ★通ったときだけ数えます（断られた・失敗したものは数えません） */
+    if (CMDS[i].writes) db->writes++;
     s = peek(p);
     if (s != 0 && s != '\n' && s != '\x01') {
         perr(p, "文のあとに余分な文字があります");
@@ -3513,6 +3521,22 @@ const char *yui_notice(yui *db) { return db ? db->notice : NULL; }
  *   rc == YUI_ERROR と書いている使い手が、黙って「成功」と読みます。
  */
 int yui_busy(const yui *db) { return db ? db->busy : 0; }
+
+unsigned long yui_writes(const yui *db) { return db ? db->writes : 0UL; }
+
+int yui_set_readonly(yui *db, int on) {
+    if (!db) return YUI_ERROR;
+    /*
+     * ★共有で開いているときは外せません。共有の錠は「読む人どうしは待たない」
+     *   という約束なので、ここで書けるようにすると約束が破れます。
+     */
+    if (on == 0 && db->shared) {
+        set_err(db, "共有で開いているので、書けるようにはできません");
+        return YUI_ERROR;
+    }
+    db->readonly = on ? 1 : 0;
+    return YUI_OK;
+}
 
 int yui_close(yui *db) {
     int rc = YUI_OK;

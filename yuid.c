@@ -7,8 +7,23 @@
  *   同じファイルを複数のプロセスから使えません。このデーモンが 1 つだけ持ち、
  *   口（127.0.0.1 の TCP）を通して何人にも読ませます。
  *
- * ★段 1 は読むだけです（YUI_READONLY）。書けるようにするのは段 2 で、そのとき
- *   「誰が・いつ」をデーモンが押します。設計は docs/デーモンの構想.md が正です。
+ * ★既定は読むだけです。--write を付けると書けるようになりますが、
+ *   **名乗った接続だけ**です（名乗らない接続は読むだけのまま）。
+ *   書き込みが通ると、デーモンが「誰が・いつ」を押します。
+ *   設計は docs/デーモンの構想.md が正です。
+ *
+ * ★帰属の形（段 2）
+ *     結ぶ (<ラベル>:<名前>)-[書いた {時: <いま>}]->(機:<名乗り>)   ← どれも引用符で囲みます
+ *   ★時刻は**線の属性**に置きます。点の属性に置くと、同じ機が次に書いたときに
+ *     上書きされて消えます（実測）。
+ *   ★`結ぶ` は (元, 種類, 先) が同じなら 1 本に畳むので、残るのは
+ *     **「最後に書いたのは誰か・いつか」**です。**毎回の履歴は残りません。**
+ *   ★名前は、返ってきた JSON の中身を**そのまま**引用符の中へ入れます。
+ *     結の文の逃がし方（改行・タブ・引用符・逆斜線）は JSON と同じなので、
+ *     ほどかずに往復します（実測で確認）。
+ *   ★ただし 0x20 未満の文字と復帰（CR）は、JSON が u00xx 形や r 形で逃がすのに
+ *     結の文はそれを読めません。**そういう名前には押さず、理由を言います。**
+ *     黙って別の点に付けると、`結ぶ` が無い点を作るので静かに増えます。
  *
  * ★127.0.0.1 にしか出しません。LAN へ出すのは段 3 で、合言葉が要ります。
  *
@@ -30,9 +45,8 @@
  * ★`終わる` はこの接続を切るだけです。デーモンは止まりません（止めるのは
  *   Ctrl-C か、--idle の空き時間切れ）。
  *
- * ★段 1 で見ていないこと（docs/デーモンの構想.md の段 4）
- *   返りの上限がありません。長い返りは長いまま返ります。
- *   書き出しは待つ作りです。**読まないクライアントが 1 つ居ると、全員が止まります。**
+ * ★まだ無いもの（docs/デーモンの構想.md の段 3・段 4）
+ *   LAN の口と合言葉（段 3）。名前付きパイプ。公平さ（1 本で順に回します）。
  */
 #define _POSIX_C_SOURCE 200809L
 #include "yui.h"
@@ -85,6 +99,7 @@ typedef int sock_t;
  *   （macOS で実測）、溜まりが線を超えないので検査が噛みません。
  *   小さくすれば、緩衝の大きさに関係なく確かめられます。
  */
+#define STAMP_MAX 4 /* 1 文で帰属を押す相手の上限（作る=1・結ぶ=2） */
 #define DEFAULT_HIGH_WATER (1UL * 1024UL * 1024UL)
 #define DEFAULT_MAX_OUT    (8UL * 1024UL * 1024UL)
 
@@ -139,6 +154,12 @@ typedef struct {
      *   送り残しがある接続が切られずに残ります（溜まりを送り終えてから切るので）。
      */
     int bye;
+    /*
+     * ★段 2: 名乗り。NULL なら名乗っていない ＝ 読むだけです。
+     *   接続ごとに持ちます（1 つのデーモンに書く人と読む人が混ざるので）。
+     */
+    char *me;
+    int stamp; /* 1 なら帰属を押す。「印なし」と名乗れば 0（取り込み用） */
 } Conn;
 
 /*
@@ -207,12 +228,166 @@ static void buf_json_str(Buf *b, const char *text) {
  *   上限が無いと、1 回の 探す が 10 万行 返したときに、その接続の
  *   溜まりだけでメモリを食い、他のクライアントも待たされます。
  */
+/* ------------------------------------------------- 段 2: 帰属を押す道具 */
+
+static char *dup_n(const char *p, size_t n) {
+    char *q = (char *)malloc(n + 1);
+    if (!q) {
+        fputs("yuid: メモリが足りません\n", stderr);
+        exit(1);
+    }
+    memcpy(q, p, n);
+    q[n] = 0;
+    return q;
+}
+
+/*
+ * JSON の object の直下から key を探して、値の先頭を返します。
+ * obj は { の次を指します。無ければ NULL です。
+ * ★入れ子の中は見ません（属性に name という鍵があっても拾いません）。
+ */
+static const char *json_value_of(const char *obj, const char *key) {
+    int depth = 0;
+    size_t kn = strlen(key);
+    const char *p = obj;
+    while (*p) {
+        if (*p == '"') {
+            const char *ks = p + 1, *q = ks;
+            while (*q && *q != '"') {
+                if (*q == '\\' && q[1]) q++;
+                q++;
+            }
+            if (*q != '"') return NULL;
+            if (depth == 0 && q[1] == ':' && (size_t)(q - ks) == kn &&
+                memcmp(ks, key, kn) == 0)
+                return q + 2;
+            p = q + 1;
+            continue;
+        }
+        if (*p == '{' || *p == '[') depth++;
+        else if (*p == '}' || *p == ']') {
+            if (depth == 0) return NULL; /* この object の終わりまで来ました */
+            depth--;
+        }
+        p++;
+    }
+    return NULL;
+}
+
+/* 文字列の値の中身を、逃がしたまま写します */
+static char *json_raw_str(const char *v) {
+    const char *q;
+    if (!v || *v != '"') return NULL;
+    q = v + 1;
+    while (*q && *q != '"') {
+        if (*q == '\\' && q[1]) q++;
+        q++;
+    }
+    if (*q != '"') return NULL;
+    return dup_n(v + 1, (size_t)(q - v - 1));
+}
+
+/*
+ * ★そのまま結の文へ差して往復するか。
+ *   結の文が読める逃がしは 改行・タブ・引用符・逆斜線 の 4 つだけです。
+ *   JSON は 0x20 未満を u00xx 形、復帰を r 形で出すので、入っていたら 0 を返します。
+ */
+static int stamp_safe(const char *s) {
+    for (; *s; s++) {
+        if (*s != '\\') continue;
+        if (!s[1]) return 0;
+        if (s[1] != 'n' && s[1] != 't' && s[1] != '"' && s[1] != '\\') return 0;
+        s++; /* 逃がした 1 文字を飛ばします */
+    }
+    return 1;
+}
+
+/* 生の文字列を、結の文の引用符の中に書ける形にして足します */
+static void buf_stmt_str(Buf *b, const char *s) {
+    for (; *s; s++) {
+        if (*s == '"' || *s == '\\') buf_mem(b, "\\", 1);
+        buf_mem(b, s, 1);
+    }
+}
+
+/* いまの時刻。RFC 3339 の形（例 2026-11-11T09:12:34+09:00）*/
+static void now_iso(char *buf, size_t n) {
+    time_t t = time(NULL);
+    struct tm *lt = localtime(&t);
+    char z[8];
+    size_t len;
+    if (!lt || strftime(buf, n, "%Y-%m-%dT%H:%M:%S", lt) == 0) {
+        snprintf(buf, n, "1970-01-01T00:00:00Z");
+        return;
+    }
+    len = strlen(buf);
+    /* ★%z は +0900 の形で返るので、: を入れて RFC 3339 に合わせます */
+    if (strftime(z, sizeof z, "%z", lt) == 5 && (z[0] == '+' || z[0] == '-') &&
+        len + 6 < n) {
+        snprintf(buf + len, n - len, "%c%c%c:%c%c", z[0], z[1], z[2], z[3], z[4]);
+        return;
+    }
+    /*
+     * ★ずれが取れないときは UTC で書きます。ずれを書かないでおくと
+     *   「何時のことか」が分からない記録になります。
+     */
+    {
+        struct tm *gt = gmtime(&t);
+        if (gt && strftime(buf, n, "%Y-%m-%dT%H:%M:%SZ", gt) > 0) return;
+        snprintf(buf, n, "1970-01-01T00:00:00Z");
+    }
+}
+
+typedef struct {
+    char *label; /* 生の JSON の中身（逃がしたまま） */
+    char *name;
+} Target;
+
 typedef struct {
     Buf *out;
     long max_rows; /* 0 なら上限なし */
     long rows;
     int cut; /* 1 なら上限で打ち切った */
+    /*
+     * ★段 2: 帰属を押す相手。この文が出した点を控えます。
+     *   読む文でも控えますが、押すのは「書き込みが通ったとき」だけなので
+     *   害はありません（見分けるのは yui_writes() で、文面は見ません）。
+     */
+    Target tgt[STAMP_MAX];
+    int ntgt;
+    int max_tgt; /* ★押す相手の上限。--max-stamp で小さくできます（検査のため） */
+    int tgt_over; /* 1 なら相手が多くて取りきれなかった */
 } Sink;
+
+/* 控えた相手を捨てます（1 文ごとに呼びます） */
+static void tgt_clear(Sink *k) {
+    int i;
+    for (i = 0; i < k->ntgt; i++) {
+        free(k->tgt[i].label);
+        free(k->tgt[i].name);
+    }
+    k->ntgt = 0;
+    k->tgt_over = 0;
+}
+
+/* obj（{ の次）から label と name を控えます */
+static void tgt_add(Sink *k, const char *obj) {
+    char *lb, *nm;
+    if (k->ntgt >= k->max_tgt || k->ntgt >= STAMP_MAX) {
+        k->tgt_over = 1;
+        return;
+    }
+    lb = json_raw_str(json_value_of(obj, "label"));
+    nm = json_raw_str(json_value_of(obj, "name"));
+    if (!lb || !nm) {
+        free(lb);
+        free(nm);
+        return;
+    }
+    k->tgt[k->ntgt].label = lb;
+    k->tgt[k->ntgt].name = nm;
+    k->ntgt++;
+}
 
 static int out_row(void *ctx, int kind, const char *text) {
     Sink *k = (Sink *)ctx;
@@ -229,27 +404,191 @@ static int out_row(void *ctx, int kind, const char *text) {
     buf_str(k->out, text);
     buf_str(k->out, "\n");
     k->rows++;
+    /*
+     * ★帰属を押す相手を控えます。点の行はその点、線の行は両端です。
+     *   ★線そのものには押せません（結の線は点と点を結ぶものなので、
+     *     線を端にできません）。だから `結ぶ` では両端の点に押します。
+     */
+    if (text[0] == '{') {
+        const char *obj = text + 1;
+        char *kd = json_raw_str(json_value_of(obj, "kind"));
+        if (kd && strcmp(kd, "node") == 0) {
+            tgt_add(k, obj);
+        } else if (kd && strcmp(kd, "edge") == 0) {
+            const char *f = json_value_of(obj, "from");
+            const char *t = json_value_of(obj, "to");
+            if (f && *f == '{') tgt_add(k, f + 1);
+            if (t && *t == '{') tgt_add(k, t + 1);
+        }
+        free(kd);
+    }
     return 0;
+}
+
+/* 帰属の文の返りは、相手に見せません（頼まれていないので） */
+static int out_none(void *ctx, int kind, const char *text) {
+    (void)ctx;
+    (void)kind;
+    (void)text;
+    return 0;
+}
+
+/*
+ * 控えた相手に「誰が・いつ」を押します。
+ * 戻り値: 0 = 全部 押せた、1 = 押せなかったものがある（理由は out に足します）
+ */
+static int stamp_targets(yui *db, Sink *k, const char *me, Buf *out) {
+    int i, bad = 0;
+    char when[64];
+    now_iso(when, sizeof when);
+    for (i = 0; i < k->ntgt; i++) {
+        Buf q;
+        int rc;
+        if (!stamp_safe(k->tgt[i].label) || !stamp_safe(k->tgt[i].name)) {
+            /*
+             * ★押しません。そのまま差すと別の点に付き、`結ぶ` は無い点を
+             *   作るので静かに増えます。書き込みそのものは通っています。
+             */
+            buf_str(out, "{\"kind\":\"error\",\"text\":");
+            buf_json_str(out,
+                         "帰属を押せませんでした: 点の名前かラベルに、結の文で書けない"
+                         "文字（0x20 より小さい字か 復帰）が入っています。"
+                         "書き込みそのものは通っています");
+            buf_str(out, "}\n");
+            bad = 1;
+            continue;
+        }
+        memset(&q, 0, sizeof q);
+        buf_str(&q, "結ぶ (\"");
+        buf_str(&q, k->tgt[i].label); /* ★逃がしたまま。JSON と同じ形なので往復します */
+        buf_str(&q, "\":\"");
+        buf_str(&q, k->tgt[i].name);
+        buf_str(&q, "\")-[書いた {時: \"");
+        buf_str(&q, when);
+        buf_str(&q, "\"}]->(機:\"");
+        buf_stmt_str(&q, me); /* ★名乗りは生の文字列なので、ここで逃がします */
+        buf_str(&q, "\")");
+        rc = yui_exec_json(db, q.p ? q.p : "", out_none, NULL);
+        if (rc == YUI_ERROR) {
+            buf_str(out, "{\"kind\":\"error\",\"text\":");
+            buf_json_str(out, yui_errmsg(db));
+            buf_str(out, "}\n");
+            bad = 1;
+        }
+        free(q.p);
+    }
+    if (k->tgt_over) {
+        buf_str(out, "{\"kind\":\"error\",\"text\":");
+        buf_json_str(out, "帰属を押しきれませんでした: この文が触った点が多すぎます");
+        buf_str(out, "}\n");
+        bad = 1;
+    }
+    return bad;
+}
+
+/*
+ * 名乗りの文かどうか見ます。そうなら 1 を返して、名前と印の有無を入れます。
+ *   名乗る <名前>           帰属を押します
+ *   名乗る <名前> 印なし    押しません（何万件も書く取り込み用）
+ * <名前> は引用符で囲んでも構いません。
+ *
+ * ★これはデーモンだけの言葉で、結のライブラリには入れていません。
+ *   言葉は開けたあとにしか打てないので、接続の性質を決めるのに向きません。
+ * ★返り 1 で *name が NULL なら、形が違うということです（*why に理由）。
+ */
+static int parse_hello(const char *line, char **name, int *stamp, const char **why) {
+    static const char *KW = "名乗る";
+    const char *p = line, *e;
+    size_t kn = strlen(KW), n;
+    char *out;
+    while (*p == ' ' || *p == '\t') p++;
+    if (strncmp(p, KW, kn) != 0) return 0;
+    if (p[kn] && p[kn] != ' ' && p[kn] != '\t') return 0;
+    *name = NULL;
+    *stamp = 1;
+    *why = NULL;
+    p += kn;
+    while (*p == ' ' || *p == '\t') p++;
+    e = p + strlen(p);
+    while (e > p && (e[-1] == ' ' || e[-1] == '\t' || e[-1] == '\r')) e--;
+    /* ★末尾の「印なし」を先に外します */
+    {
+        static const char *NO = "印なし";
+        size_t nn = strlen(NO);
+        if ((size_t)(e - p) > nn && memcmp(e - nn, NO, nn) == 0 &&
+            (e[-(int)nn - 1] == ' ' || e[-(int)nn - 1] == '\t')) {
+            *stamp = 0;
+            e -= nn;
+            while (e > p && (e[-1] == ' ' || e[-1] == '\t')) e--;
+        }
+    }
+    if (e == p) {
+        *why = "名乗る のあとに名前がありません";
+        return 1;
+    }
+    /* 引用符で囲まれていたら、ほどきます */
+    if (*p == '"' && e - p >= 2 && e[-1] == '"') {
+        const char *q;
+        Buf b;
+        memset(&b, 0, sizeof b);
+        for (q = p + 1; q < e - 1; q++) {
+            if (*q == '\\' && q + 1 < e - 1) {
+                char c = q[1];
+                if (c == 'n') c = '\n';
+                else if (c == 't') c = '\t';
+                else if (c != '"' && c != '\\') {
+                    buf_mem(&b, q, 1);
+                    continue;
+                }
+                buf_mem(&b, &c, 1);
+                q++;
+                continue;
+            }
+            buf_mem(&b, q, 1);
+        }
+        out = dup_n(b.p ? b.p : "", b.n);
+        free(b.p);
+    } else {
+        out = dup_n(p, (size_t)(e - p));
+    }
+    /*
+     * ★名乗りに 0x20 未満の字は入れさせません。帰属の文に書けないので、
+     *   受け取ってから「押せません」と言うより、ここで断るほうが親切です。
+     */
+    for (n = 0; out[n]; n++) {
+        if ((unsigned char)out[n] < 0x20) {
+            free(out);
+            *why = "名乗りに 0x20 より小さい文字は使えません";
+            return 1;
+        }
+    }
+    *name = out;
+    return 1;
 }
 
 /*
  * 問い合わせ 1 件を実行して、返す中身を out に組みます。
  * 戻り値: 0 = 続ける、1 = この接続を切る（終わる を受けた）
  */
-static int run_req(yui *db, const char *body, size_t blen, Buf *out, long max_rows) {
+static int run_req(yui *db, Conn *c, const char *body, size_t blen, long max_rows,
+                   int writable, int max_stamp) {
     size_t i = 0;
     unsigned long lineno = 0;
     int failed = 0, bye = 0;
+    Buf *out = &c->out;
     Sink sink;
+    memset(&sink, 0, sizeof sink);
     sink.out = out;
     sink.max_rows = max_rows;
-    sink.rows = 0;
-    sink.cut = 0;
+    sink.max_tgt = max_stamp;
 
     while (i <= blen && !bye && !sink.cut) {
-        size_t j = i;
+            size_t j = i;
         char *line;
         int rc;
+        char *hello_name = NULL;
+        int hello_stamp = 1;
+        const char *hello_why = NULL;
         while (j < blen && body[j] != '\n') j++;
         if (i == blen && blen > 0) break; /* 末尾の改行のあと */
         line = (char *)malloc(j - i + 1);
@@ -282,8 +621,60 @@ static int run_req(yui *db, const char *body, size_t blen, Buf *out, long max_ro
             buf_json_str(out, msg);
             buf_str(out, "}\n");
             failed = 1;
+        } else if (parse_hello(line, &hello_name, &hello_stamp, &hello_why)) {
+            /* ★名乗りはデーモンが受け取ります。結には渡しません */
+            if (!hello_name) {
+                buf_str(out, "{\"kind\":\"error\",\"line\":");
+                {
+                    char nb[32];
+                    snprintf(nb, sizeof nb, "%lu", lineno);
+                    buf_str(out, nb);
+                }
+                buf_str(out, ",\"text\":");
+                buf_json_str(out, hello_why ? hello_why : "名乗りの形が違います");
+                buf_str(out, "}\n");
+                failed = 1;
+            } else {
+                free(c->me);
+                c->me = hello_name;
+                c->stamp = hello_stamp;
+                buf_str(out, "{\"kind\":\"hello\",\"name\":");
+                buf_json_str(out, c->me);
+                buf_str(out, ",\"write\":");
+                buf_str(out, writable ? "true" : "false");
+                buf_str(out, ",\"stamp\":");
+                buf_str(out, c->stamp ? "true" : "false");
+                buf_str(out, "}\n");
+                /*
+                 * ★デーモンが --write 無しで立っているなら、名乗っても読むだけです。
+                 *   黙って読むだけにすると「書いたつもり」が生まれるので、
+                 *   write:false を返して相手に分かるようにしています。
+                 */
+            }
         } else {
+            unsigned long w0;
+            /*
+             * ★相手ごとに書けるかを切り替えます。名乗っていない接続は読むだけです。
+             *   動詞の一覧はこちらに持ちません（結の表が正。増えた日にズレます）。
+             */
+            if (writable && yui_set_readonly(db, (c->me ? 0 : 1)) != YUI_OK) {
+                buf_str(out, "{\"kind\":\"error\",\"text\":");
+                buf_json_str(out, yui_errmsg(db));
+                buf_str(out, "}\n");
+                failed = 1;
+                free(line);
+                break;
+            }
+            tgt_clear(&sink);
+            w0 = yui_writes(db);
             rc = yui_exec_json(db, line, out_row, &sink);
+            /*
+             * ★書き込みが通ったときだけ帰属を押します。見分けるのは
+             *   yui_writes() の増減で、締めの行の文面は見ません。
+             */
+            if (yui_writes(db) > w0 && c->me && c->stamp) {
+                if (stamp_targets(db, &sink, c->me, out)) failed = 1;
+            }
             if (rc == YUI_ERROR) {
                 char nb[32];
                 buf_str(out, "{\"kind\":\"error\",\"line\":");
@@ -321,6 +712,7 @@ static int run_req(yui *db, const char *body, size_t blen, Buf *out, long max_ro
         buf_str(out, "}\n");
         failed = 1;
     }
+    tgt_clear(&sink);
     buf_str(out, failed ? "{\"kind\":\"end\",\"rc\":1" : "{\"kind\":\"end\",\"rc\":0");
     if (bye) buf_str(out, ",\"bye\":true");
     if (sink.cut) buf_str(out, ",\"cut\":true");
@@ -377,14 +769,20 @@ static int take_req(Conn *c, char **body, size_t *blen, const char **why) {
 
 static void usage(const char *me) {
     fprintf(stderr,
-            "使い方: %s ファイル [--port N] [--idle 秒] [--max-rows N]\n"
-            "  127.0.0.1 で待ち受けて、読むだけの問い合わせに答えます。\n"
+            "使い方: %s ファイル [--write] [--port N] [--idle 秒] [--max-rows N]\n"
+            "  127.0.0.1 で待ち受けて、問い合わせに答えます。\n"
+            "  --write     書けるようにします（既定は読むだけ）。\n"
+            "              ★書けるのは「名乗る <名前>」を送った接続だけです。\n"
+            "              ★書き込みが通ると、デーモンが「誰が・いつ」を押します\n"
+            "              （結ぶ (点)-[書いた {時}]->(機:名乗り)）。\n"
+            "              押さずに書くなら「名乗る <名前> 印なし」。\n"
+            "  --max-stamp 1 つの文で帰属を押す相手の上限（既定 %d・検査のため）\n"
             "  --port      既定 %d\n"
             "  --idle      誰も繋いでいない状態がこの秒数 続いたら終わります（既定 0＝終わらない）\n"
             "  --max-rows  1 回の問い合わせで返す行の上限（既定 %d・0 で外す）\n"
             "              ★超えたら打ち切り、end に cut を付けて言います\n"
             "  --max-out   受け取らない接続を切るまでの溜まり（バイト・既定 %lu）\n",
-            me, DEFAULT_PORT, DEFAULT_MAX_ROWS, (unsigned long)DEFAULT_MAX_OUT);
+            me, STAMP_MAX, DEFAULT_PORT, DEFAULT_MAX_ROWS, (unsigned long)DEFAULT_MAX_OUT);
 }
 
 int main(int argc, char **argv) {
@@ -394,6 +792,13 @@ int main(int argc, char **argv) {
     struct sockaddr_in addr;
     int i, port = DEFAULT_PORT, idle = 0, nconn = 0, rc = 0, yes = 1;
     long max_rows = DEFAULT_MAX_ROWS;
+    int writable = 0; /* --write で 1。既定は読むだけです */
+    /*
+     * ★押す相手の上限。既定のままでは、いまの言葉では超えません
+     *   （作る=1・結ぶ=2）。小さくできるようにしてあるのは検査のためで、
+     *   「押しきれなかったときに黙らないこと」を確かめる道がほかにありません。
+     */
+    int max_stamp = STAMP_MAX;
     unsigned long max_out = DEFAULT_MAX_OUT, high_water = DEFAULT_HIGH_WATER;
     const char *path = NULL;
     time_t last = time(NULL);
@@ -424,6 +829,11 @@ int main(int argc, char **argv) {
             idle = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--max-rows") == 0 && i + 1 < argc) {
             max_rows = atol(argv[++i]);
+        } else if (strcmp(argv[i], "--write") == 0) {
+            writable = 1;
+        } else if (strcmp(argv[i], "--max-stamp") == 0 && i + 1 < argc) {
+            max_stamp = atoi(argv[++i]);
+            if (max_stamp < 1) max_stamp = 1;
         } else if (strcmp(argv[i], "--max-out") == 0 && i + 1 < argc) {
             max_out = strtoul(argv[++i], NULL, 10);
         } else if (argv[i][0] == '-') {
@@ -497,8 +907,15 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    snprintf(name, sizeof name, "yuid %s port=%d", YUI_VERSION, port);
-    if (yui_open_locked(path, name, YUI_READONLY, &db) != YUI_OK) {
+    snprintf(name, sizeof name, "yuid %s port=%d%s", YUI_VERSION, port,
+             writable ? " write" : "");
+    /*
+     * ★--write のときは YUI_READONLY を付けずに開き、そのうえで
+     *   すぐ「読むだけ」に戻します。名乗った接続のときだけ外します。
+     *   ★YUI_READONLY はファイルの開き方を変えず「断る」だけなので、
+     *     あとから切り替えられます（yui.h に書いてあります）。
+     */
+    if (yui_open_locked(path, name, writable ? 0 : YUI_READONLY, &db) != YUI_OK) {
         /* ★錠で断られたときは 3。CLI と揃えます
          *   （見張る仕組みが「あとで建て直せばよい」と判できるように） */
         int busy = yui_busy(db);
@@ -507,9 +924,16 @@ int main(int argc, char **argv) {
         sock_close(lis);
         return busy ? 3 : 1;
     }
+    if (writable && yui_set_readonly(db, 1) != YUI_OK) {
+        fprintf(stderr, "yuid: %s\n", yui_errmsg(db));
+        yui_close(db);
+        sock_close(lis);
+        return 1;
+    }
     if (yui_notice(db)) fprintf(stderr, "yuid: お知らせ: %s\n", yui_notice(db));
-    fprintf(stderr, "yuid: 127.0.0.1:%d で待っています（読むだけ・返りは %ld 行まで）: %s\n", port,
-            max_rows, path);
+    fprintf(stderr,
+            "yuid: 127.0.0.1:%d で待っています（%s・返りは %ld 行まで）: %s\n", port,
+            writable ? "名乗れば書けます" : "読むだけ", max_rows, path);
 
     while (!stop_now) {
         fd_set rd, wr;
@@ -607,7 +1031,9 @@ int main(int argc, char **argv) {
                         conns[i].bye = 1; /* 形が違う相手とは、送り終えたら切ります */
                         break;
                     }
-                    conns[i].bye = run_req(db, body, blen, &conns[i].out, max_rows);
+                    conns[i].bye =
+                        run_req(db, &conns[i], body, blen, max_rows, writable,
+                                max_stamp);
                     used = (size_t)(body - conns[i].in.p) + blen;
                     buf_drop(&conns[i].in, used);
                 }
@@ -629,6 +1055,7 @@ int main(int argc, char **argv) {
                 sock_close(conns[i].s);
                 free(conns[i].in.p);
                 free(conns[i].out.p);
+                free(conns[i].me);
                 conns[i] = conns[nconn - 1];
                 nconn--;
             } else {
@@ -641,6 +1068,7 @@ int main(int argc, char **argv) {
         sock_close(conns[i].s);
         free(conns[i].in.p);
         free(conns[i].out.p);
+        free(conns[i].me);
     }
     sock_close(lis);
     if (yui_close(db) != YUI_OK) {

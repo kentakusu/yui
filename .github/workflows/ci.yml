@@ -307,7 +307,41 @@ jobs:
           #   （落ちた持ち主の錠は残り、壊すかは使う側が決める）。ここではその確認です。
           if (-not (Test-Path "d.yui.錠")) { throw "落とされた持ち主の錠が消えています（残るのが正しい）" }
           Remove-Item "d.yui.錠"
-          Write-Host "デーモン（段 1）: 通りました"
+          # ----------------------------------------- 段 2（Windows で見る）
+          # ★tests/daemon.sh は sh が要るので Windows では走りません。
+          #   ここを置かないと、Windows の段 2 は一度も通らないまま残ります。
+          $w = Start-Process -FilePath ".\yuid.exe" `
+            -ArgumentList "w.yui","--write","--port","39244" `
+            -PassThru -RedirectStandardError "yuidw.err" -NoNewWindow
+          $i = 0
+          while ($i -lt 100) {
+            if ((Test-Path "yuidw.err") -and (Get-Content "yuidw.err" -Raw) -match "で待っています") { break }
+            Start-Sleep -Milliseconds 100; $i++
+          }
+          if ((Get-Content "yuidw.err" -Raw) -notmatch "名乗れば書けます") {
+            throw "書けるのに、立つときにそう言っていません: $(Get-Content 'yuidw.err' -Raw)"
+          }
+
+          # 名乗らない接続は書けない
+          $out = (.\yuid_say.exe 39244 "作る (人:勝手に)" | Out-String)
+          if ($out -notmatch "読むだけで開いています") { throw "名乗らない接続が書けました: $out" }
+
+          # 名乗ってから書くと、帰属が押される
+          $out = (.\yuid_say.exe 39244 "名乗る ""win-ci""" "作る (決定:ある決めごと)" | Out-String)
+          if ($out -notmatch '"write":true') { throw "write:true を返していません: $out" }
+          if ($out -notmatch "作りました") { throw "名乗っても書けていません: $out" }
+          $out = (.\yuid_say.exe 39244 "辿る (機:""win-ci"")<-[書いた]-(?何)" | Out-String)
+          if ($out -notmatch '"name":"ある決めごと"') { throw "帰属から辿れません: $out" }
+          # ★時刻は線の属性であること（点の属性に置くと、次の書き込みで上書きされて消えます）
+          if ($out -notmatch '"attrs":\{"時"') { throw "時刻が線の属性に入っていません: $out" }
+          $out = (.\yuid_say.exe 39244 "一覧 (機:)" | Out-String)
+          if ($out -match '"時"') { throw "時刻が機の点の属性に入っています（上書きで消えます）: $out" }
+
+          Stop-Process -Id $w.Id
+          $i = 0
+          while ($i -lt 100 -and (Test-Path "w.yui.錠")) { Start-Sleep -Milliseconds 100; $i++ }
+          Remove-Item "w.yui.錠" -ErrorAction SilentlyContinue
+          Write-Host "デーモン（段 1・段 2）: 通りました"
 
       - name: 土台をまたぐ比較用のファイルを作る
         run: type tests\compat.txt | .\yui.exe compat.yui
