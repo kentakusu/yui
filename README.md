@@ -382,7 +382,7 @@ yuid 記憶.yui --write --takeover --port 39200
 
 ★**どの土台でも `--takeover` を付けてください。**合図が届く土台でも、停電と強制終了は錠を残します。
 
-Windows の例です。★**管理者は要りません**（自分のタスクです）。
+Windows の例です。★**管理者は要りません。**ただし条件があり、**下の `-User` がそれです**（理由は例の下）。
 
 ```powershell
 $yuid = "C:\…\yuid.exe"
@@ -390,12 +390,20 @@ $file = "C:\…\記憶.yui"
 # ★標準エラーを捨てないこと。捨てると「なぜ立たなかったか」が残りません
 $arg  = '/c ""' + $yuid + '" "' + $file + '" --write --takeover --port 39200 2>> "C:\…\yuid.log""'
 $act = New-ScheduledTaskAction -Execute "cmd.exe" -Argument $arg
-$trg = New-ScheduledTaskTrigger -AtLogOn
+# ★-User を付けること。付けないと「全ユーザーのログオン時」になり、管理者が要ります
+$me  = "$env:USERDOMAIN\$env:USERNAME"
+$trg = New-ScheduledTaskTrigger -AtLogOn -User $me
+$prn = New-ScheduledTaskPrincipal -UserId $me -LogonType Interactive -RunLevel Limited
 $set = New-ScheduledTaskSettingsSet -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) `
        -ExecutionTimeLimit (New-TimeSpan -Seconds 0) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
-Register-ScheduledTask -TaskName "yui-daemon" -Action $act -Trigger $trg -Settings $set
+Register-ScheduledTask -TaskName "yui-daemon" -Action $act -Trigger $trg -Settings $set -Principal $prn
 ```
 
+- ★★**`-User` を省かないこと。**省くと「**全ユーザーの**ログオン時」という意味になり、
+  **昇格していない PowerShell では `Register-ScheduledTask` が「アクセスが拒否されました」で落ちます**
+  （`schtasks /create` でも同じ。API の違いではありません）。
+  ★**断られ方が「管理者で実行してください」ではなく素の拒否なので、原因が `-User` だと分かりません。**
+  対照（2026-11-15・Windows 11 Pro 26300 で実測）: `-User` なし → 拒否、`-User` あり → `State=Ready`
 - ★**`-ExecutionTimeLimit` を 0 にすること。**既定は 3 日で、黙って切られます
 - ★**`cmd.exe` を挟むのは、標準エラーを残すためだけです。**タスクスケジューラは出力を捕まえません
 - 止めるのは `Stop-ScheduledTask -TaskName "yui-daemon"`、消すのは `Unregister-ScheduledTask`
