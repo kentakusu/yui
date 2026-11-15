@@ -9,8 +9,14 @@ import sys
 
 # このファイルの 2 つ上（tests/breakers/ → tests/ → リポジトリの根）
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-SRC = os.path.join(REPO, "yuid.c")
-BAK = os.path.join(tempfile.gettempdir(), "yuid.c.orig")
+# ★当てる先は 2 つあります。残骸の錠を「残骸かどうか」測るのは yui.c の側なので、
+#   そこを壊せないと、いちばん危ない向き（生きている錠を壊して二重に書く）の
+#   対照が取れません。
+SRCS = {
+    "yuid.c": os.path.join(REPO, "yuid.c"),
+    "yui.c": os.path.join(REPO, "yui.c"),
+}
+BAKS = dict((k, os.path.join(tempfile.gettempdir(), k + ".orig")) for k in SRCS)
 
 BREAKS = [
     (
@@ -43,8 +49,11 @@ BREAKS = [
         "読むだけで開かない（YUI_READONLY を外す）",
         [
             (
-                "if (yui_open_locked(path, name, writable ? 0 : YUI_READONLY, &db) != YUI_OK) {",
-                "if (yui_open_locked(path, name, 0, &db) != YUI_OK) {",
+                # ★この行は --takeover の建て直しにも在るので、後ろまで含めて絞ります
+                "if (yui_open_locked(path, name, writable ? 0 : YUI_READONLY, &db) != YUI_OK) {"
+                "\n        /* ★錠で断られたときは 3。CLI と揃えます",
+                "if (yui_open_locked(path, name, 0, &db) != YUI_OK) {"
+                "\n        /* ★錠で断られたときは 3。CLI と揃えます",
             )
         ],
     ),
@@ -109,8 +118,10 @@ BREAKS = [
         "錠を取らない（ファイルの持ち主にならない）",
         [
             (
-                "if (yui_open_locked(path, name, writable ? 0 : YUI_READONLY, &db) != YUI_OK) {",
-                "if (yui_open(path, &db) != YUI_OK) {",
+                "if (yui_open_locked(path, name, writable ? 0 : YUI_READONLY, &db) != YUI_OK) {"
+                "\n        /* ★錠で断られたときは 3。CLI と揃えます",
+                "if (yui_open(path, &db) != YUI_OK) {"
+                "\n        /* ★錠で断られたときは 3。CLI と揃えます",
             )
         ],
     ),
@@ -168,6 +179,62 @@ BREAKS = [
             ),
         ],
     ),
+    (
+        '★残骸かどうかを見ない（いつでも片付ける＝生きている錠を壊す）',
+        [
+            (
+                "yui.c",
+                "    if (pid_alive(strtoul(pidbuf, NULL, 10)) == 0) *out = 1;",
+                "    *out = 1;",
+            ),
+        ],
+    ),
+    (
+        '★別の機械の錠も片付ける（機械の名前を照合しない）',
+        [
+            (
+                "yui.c",
+                "    if (!mine[0] || !mach[0] || strcmp(mine, mach) != 0) return YUI_OK;",
+                "    if (0) return YUI_OK;",
+            ),
+        ],
+    ),
+    (
+        '--takeover を既定にする（旗が無くても片付ける）',
+        [
+            (
+                "if (busy && takeover && yui_lock_stale(path, &stale) == YUI_OK && stale) {",
+                "if (busy && yui_lock_stale(path, &stale) == YUI_OK && stale) {",
+            ),
+        ],
+    ),
+    (
+        '片付けたことを言わない',
+        [
+            (
+                'fputs("yuid: 残骸の錠を片付けて建て直します"',
+                'fputs("yuid: 建て直します"',
+            ),
+        ],
+    ),
+    (
+        '残骸かもしれないときに、常駐の口（--takeover）を教えない',
+        [
+            (
+                "            if (busy && !takeover)",
+                "            if (0)",
+            ),
+        ],
+    ),
+    (
+        '合図（SIGTERM）を受けない（丁寧に止めても錠が残る）',
+        [
+            (
+                "#ifdef SIGTERM\n    signal(SIGTERM, on_signal);\n#endif",
+                "#ifdef SIGTERM\n    /* 受けません（陽性対照）*/\n#endif",
+            ),
+        ],
+    ),
 ]
 
 
@@ -184,9 +251,16 @@ def run():
     return r.returncode, ng
 
 
+def restore(orig):
+    for k in SRCS:
+        open(SRCS[k], "w", encoding="utf-8").write(orig[k])
+
+
 def main():
-    shutil.copy(SRC, BAK)
-    orig = open(BAK, encoding="utf-8").read()
+    orig = {}
+    for k in SRCS:
+        shutil.copy(SRCS[k], BAKS[k])
+        orig[k] = open(BAKS[k], encoding="utf-8").read()
     rc, err = build()
     if rc != 0:
         print("素でビルドできません:\n" + err[-1500:])
@@ -201,18 +275,22 @@ def main():
 
     bad = []
     for name, reps in BREAKS:
-        text = orig
+        text = dict(orig)
         miss = False
-        for old, new in reps:
-            if text.count(old) != 1:
-                print("=== %s ===\n  ★当てる場所が %d 件。壊せていません" % (name, text.count(old)))
+        for rep in reps:
+            # ★2 つ組は yuid.c、3 つ組は 1 つ目がファイル名です
+            f, old, new = rep if len(rep) == 3 else ("yuid.c", rep[0], rep[1])
+            if text[f].count(old) != 1:
+                print("=== %s ===\n  ★%s に当てる場所が %d 件。壊せていません"
+                      % (name, f, text[f].count(old)))
                 bad.append(name + "（場所なし）")
                 miss = True
                 break
-            text = text.replace(old, new)
+            text[f] = text[f].replace(old, new)
         if miss:
             continue
-        open(SRC, "w", encoding="utf-8").write(text)
+        for k in SRCS:
+            open(SRCS[k], "w", encoding="utf-8").write(text[k])
         brc, berr = build()
         print("=== %s ===" % name)
         if brc != 0:
@@ -230,13 +308,17 @@ def main():
             if rc2 == 0:
                 print("  ★落ちませんでした ＝ この壊れ方を見ている検査が無い")
                 bad.append(name + "（落ちない）")
-        open(SRC, "w", encoding="utf-8").write(orig)
+        restore(orig)
 
-    now = hashlib.md5(open(SRC, "rb").read()).hexdigest()
-    was = hashlib.md5(open(BAK, "rb").read()).hexdigest()
-    print("=== 後始末 === yuid.c は元どおり: %s" % (now == was))
+    same = True
+    for k in SRCS:
+        now = hashlib.md5(open(SRCS[k], "rb").read()).hexdigest()
+        was = hashlib.md5(open(BAKS[k], "rb").read()).hexdigest()
+        print("=== 後始末 === %s は元どおり: %s" % (k, now == was))
+        if now != was:
+            same = False
     build()
-    if now != was or bad:
+    if not same or bad:
         for b in bad:
             print("  - " + b)
         return 1

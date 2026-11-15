@@ -343,6 +343,64 @@ make yuid                       # Linux / macOS（Windows は build.bat）
 
 ★**打ち切ると、その問い合わせの残りの行も実行しません。**`end` の `"cut":true` で分かります。
 
+### 常駐させる（`--takeover`）
+
+★**丁寧でない止め方のあとは `<パス>.錠` が残ります。**合図（Ctrl-C / `SIGTERM`）を受けたときは外しますが、**タスクの終了・ログオフ・停電では残ります。**
+
+常駐させると、これが効いてきます。残骸が残ると**次の自動起動が `rc=3` で止まり、そのまま止まり続けます。**人が気づいてファイルを消すまで、記憶に誰も繋げません。
+
+`--takeover` を付けると、**残骸なら片付けて建て直します。**
+
+```sh
+yuid 記憶.yui --write --takeover --port 39200
+```
+
+★**片付けるのは「この機械が書いた錠で、その pid がもう居ない」ときだけです。**
+
+| 錠の持ち主 | `--takeover` | なぜ |
+|---|---|---|
+| この機械・pid が居ない | ★**片付けて立つ** | 残骸と言えます |
+| この機械・pid が居る | **断る（`rc=3`）** | 生きています |
+| 別の機械 | **断る（`rc=3`）** | ★その機械の pid は、ここからは見られません |
+| pid が使い回されている | **断る（`rc=3`）** | 「まだ居る」と出ます |
+
+★**外れ方は「壊さない側」に倒してあります。**残骸が残って止まるほうが、2 つのプロセスが同じファイルに書くより軽いからです。前者は `rc=3` で見えますが、後者は静かに壊れます。
+
+片付けたときは、**片付けた錠の中身を標準エラーに出します**（黙りません）。
+
+★**旗を付けていないときは、`rc=3` と一緒に「`--takeover` を付けてください」と言います。**残骸かどうかはこちらでは決めません。
+
+#### 土台ごとの常駐のさせ方
+
+★**結にサービスの皮は作りません。**土台にある仕組みに任せます（C99 のまま・外のライブラリは要りません）。
+
+| 土台 | 使う仕組み | 止めたときに錠が外れるか |
+|---|---|---|
+| Windows | タスクスケジューラ（ログオン時） | ★**実測: 外れません**（タスクの終了は合図を渡しません） |
+| macOS | launchd（LaunchAgent） | 測っていません（`SIGTERM` を送る作りだと取説に在ります） |
+| Linux | systemd のユーザー unit | 測っていません（同上） |
+
+★**どの土台でも `--takeover` を付けてください。**合図が届く土台でも、停電と強制終了は錠を残します。
+
+Windows の例です。★**管理者は要りません**（自分のタスクです）。
+
+```powershell
+$yuid = "C:\…\yuid.exe"
+$file = "C:\…\記憶.yui"
+# ★標準エラーを捨てないこと。捨てると「なぜ立たなかったか」が残りません
+$arg  = '/c ""' + $yuid + '" "' + $file + '" --write --takeover --port 39200 2>> "C:\…\yuid.log""'
+$act = New-ScheduledTaskAction -Execute "cmd.exe" -Argument $arg
+$trg = New-ScheduledTaskTrigger -AtLogOn
+$set = New-ScheduledTaskSettingsSet -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) `
+       -ExecutionTimeLimit (New-TimeSpan -Seconds 0) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+Register-ScheduledTask -TaskName "yui-daemon" -Action $act -Trigger $trg -Settings $set
+```
+
+- ★**`-ExecutionTimeLimit` を 0 にすること。**既定は 3 日で、黙って切られます
+- ★**`cmd.exe` を挟むのは、標準エラーを残すためだけです。**タスクスケジューラは出力を捕まえません
+- 止めるのは `Stop-ScheduledTask -TaskName "yui-daemon"`、消すのは `Unregister-ScheduledTask`
+- ★**立ったかどうかは、ログの「で待っています」の行で見てください。**タスクが「実行中」でも、錠で断られて終わっていることがあります
+
 ### 気をつけること（デーモン）
 
 - ★**デーモンを立てている間、CLI からは同じファイルを開けません。**デーモンが錠を持ちます。**全員がデーモンを通るか、全員が CLI を使うかの、どちらかです**
@@ -351,7 +409,7 @@ make yuid                       # Linux / macOS（Windows は build.bat）
 - **読まないクライアントで止まりません。**待たずに送り、溜まりが 1 MB を超えたらその接続から新しい問い合わせを読まず、**`--max-out`（既定 8 MB）を超えたらその接続を切ります**（他のクライアントを守るため。切ったことは標準エラーに出ます）
 - ★**公平さはありません。**1 本で順に回すので、重い問い合わせの間は他が順番を待ちます（止まるのではなく、待つだけです）
 - ★**`127.0.0.1` にしか出しません。**`networkingMode=Mirrored` の環境では、これで Windows と WSL2 の両方から使えます（既定の NAT では共有されません）
-- ★**異常終了すると `<パス>.錠` が残ります。**合図（Ctrl-C / SIGTERM）を受けたときは外します
+- ★**異常終了すると `<パス>.錠` が残ります。**合図（Ctrl-C / SIGTERM）を受けたときは外します。常駐させるなら [`--takeover`](#常駐させる--takeover) を付けてください
 
 ## 言葉
 

@@ -769,7 +769,7 @@ static int take_req(Conn *c, char **body, size_t *blen, const char **why) {
 
 static void usage(const char *me) {
     fprintf(stderr,
-            "使い方: %s ファイル [--write] [--port N] [--idle 秒] [--max-rows N]\n"
+            "使い方: %s ファイル [--write] [--takeover] [--port N] [--idle 秒] [--max-rows N]\n"
             "  127.0.0.1 で待ち受けて、問い合わせに答えます。\n"
             "  --write     書けるようにします（既定は読むだけ）。\n"
             "              ★書けるのは「名乗る <名前>」を送った接続だけです。\n"
@@ -777,6 +777,9 @@ static void usage(const char *me) {
             "              （結ぶ (点)-[書いた {時}]->(機:名乗り)）。\n"
             "              押さずに書くなら「名乗る <名前> 印なし」。\n"
             "  --max-stamp 1 つの文で帰属を押す相手の上限（既定 %d・検査のため）\n"
+            "  --takeover  残骸の錠を片付けて建て直します（常駐させるとき）。\n"
+            "              ★片付けるのは「この機械が書いた錠で、pid が居ない」ときだけ。\n"
+            "              生きている錠と、別の機械の錠は片付けません（3 で断ります）。\n"
             "  --port      既定 %d\n"
             "  --idle      誰も繋いでいない状態がこの秒数 続いたら終わります（既定 0＝終わらない）\n"
             "  --max-rows  1 回の問い合わせで返す行の上限（既定 %d・0 で外す）\n"
@@ -793,6 +796,7 @@ int main(int argc, char **argv) {
     int i, port = DEFAULT_PORT, idle = 0, nconn = 0, rc = 0, yes = 1;
     long max_rows = DEFAULT_MAX_ROWS;
     int writable = 0; /* --write で 1。既定は読むだけです */
+    int takeover = 0; /* --takeover で 1。残骸の錠を片付けます */
     /*
      * ★押す相手の上限。既定のままでは、いまの言葉では超えません
      *   （作る=1・結ぶ=2）。小さくできるようにしてあるのは検査のためで、
@@ -831,6 +835,8 @@ int main(int argc, char **argv) {
             max_rows = atol(argv[++i]);
         } else if (strcmp(argv[i], "--write") == 0) {
             writable = 1;
+        } else if (strcmp(argv[i], "--takeover") == 0) {
+            takeover = 1;
         } else if (strcmp(argv[i], "--max-stamp") == 0 && i + 1 < argc) {
             max_stamp = atoi(argv[++i]);
             if (max_stamp < 1) max_stamp = 1;
@@ -919,10 +925,45 @@ int main(int argc, char **argv) {
         /* ★錠で断られたときは 3。CLI と揃えます
          *   （見張る仕組みが「あとで建て直せばよい」と判できるように） */
         int busy = yui_busy(db);
-        fprintf(stderr, "yuid: %s\n", yui_errmsg(db));
-        yui_close(db);
-        sock_close(lis);
-        return busy ? 3 : 1;
+        int stale = 0;
+        /*
+         * ★--takeover のときだけ、残骸の錠を片付けて 1 回 建て直します。
+         *   常駐させると、丁寧でない止め方（タスクの終了・ログオフ・停電）の
+         *   あとに錠が残り、**次の自動起動が黙って止まり続けます**。
+         *   そこを人の手で消させる形にしないための口です。
+         *   ★残骸と言えるのは yui_lock_stale が 1 のときだけで、
+         *     生きている錠と別の機械の錠は片付けません（yui.h に条件が在ります）。
+         */
+        if (busy && takeover && yui_lock_stale(path, &stale) == YUI_OK && stale) {
+            char was[1024];
+            if (yui_lock_owner(path, was, sizeof was) != YUI_OK) was[0] = 0;
+            fputs("yuid: 残骸の錠を片付けて建て直します"
+                  "（この機械が書いた錠で、pid が居ません）\n", stderr);
+            fputs(was, stderr);
+            yui_close(db);
+            db = NULL;
+            if (yui_lock_clear(path) != YUI_OK) {
+                fputs("yuid: 錠を片付けられませんでした\n", stderr);
+                sock_close(lis);
+                return 1;
+            }
+            if (yui_open_locked(path, name, writable ? 0 : YUI_READONLY, &db) != YUI_OK) {
+                int busy2 = yui_busy(db);
+                fprintf(stderr, "yuid: %s\n", yui_errmsg(db));
+                yui_close(db);
+                sock_close(lis);
+                return busy2 ? 3 : 1;
+            }
+        } else {
+            fprintf(stderr, "yuid: %s\n", yui_errmsg(db));
+            /* ★断ったままにするなら、常駐の口が在ることを言います */
+            if (busy && !takeover)
+                fputs("yuid: ★残骸かもしれません。常駐させるなら --takeover を"
+                      "付けてください（生きている錠は片付けません）\n", stderr);
+            yui_close(db);
+            sock_close(lis);
+            return busy ? 3 : 1;
+        }
     }
     if (writable && yui_set_readonly(db, 1) != YUI_OK) {
         fprintf(stderr, "yuid: %s\n", yui_errmsg(db));

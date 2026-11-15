@@ -1,6 +1,6 @@
 #!/bin/sh
 #
-# デーモン（yuid.c・段 1 と段 2）のテスト。
+# デーモン（yuid.c・段 1 と段 2 と 残骸の錠）のテスト。
 #   sh tests/daemon.sh ./yuid ./build/yuid_say ./yui
 #
 # ★Windows では動きません（sh が要ります）。ただし話しかける道具
@@ -402,7 +402,8 @@ FW="$D/w.yui"
 "$YUI" "$FW" '作る (決定:ある決めごと)' > /dev/null 2>&1 ||
     { echo "NG   下ごしらえ（書ける方のファイル）に失敗しました"; exit 2; }
 WPID="$D/wpid"
-trap 'for f in "$PIDFILE" "$WPID"; do if [ -f "$f" ]; then kill "$(cat "$f")" 2> /dev/null; fi; done; rm -rf "$D"' EXIT
+TPID="$D/tpid" # ★残骸の錠の節で使います。trap が参照するのでここで決めます
+trap 'for f in "$PIDFILE" "$WPID" "$TPID"; do if [ -f "$f" ]; then kill "$(cat "$f")" 2> /dev/null; fi; done; rm -rf "$D"' EXIT
 WPORT=0
 i=39240
 while [ "$i" -lt 39260 ]; do
@@ -516,6 +517,114 @@ has '"rc":1' "$out" "★押しきれなかったことが rc=1 で分かるこ�
 
 kill "$(cat "$WPID")" 2> /dev/null
 : > "$WPID"
+
+# ---------------------------------------------------------------- 残骸の錠（--takeover）
+#
+# ★常駐させると、丁寧でない止め方（タスクの終了・ログオフ・停電）のあとに
+#   `<パス>.錠` が残り、**次の自動起動が黙って止まり続けます。**
+#   人の手で消させる形にしないための口が --takeover です。
+#
+# 3 方向を見ます。★(c) を落とさないこと——いちばん危ないのは
+# 「生きている錠を壊して、2 つのプロセスが同じファイルに書く」側で、
+# これは壊れても静かです。(a)(b) はどちらも落ちれば見えます。
+FT="$D/t.yui"
+"$YUI" "$FT" '作る (決定:常駐の試し)' > /dev/null 2>&1 ||
+    { echo "NG   下ごしらえ（残骸の錠のファイル）に失敗しました"; exit 2; }
+TPORT=0
+i=39280
+while [ "$i" -lt 39300 ]; do
+    "$YUID" "$FT" --write --port "$i" --idle 600 > "$D/tlog" 2>&1 &
+    echo $! > "$TPID"
+    j=0
+    while [ "$j" -lt 50 ]; do
+        if grep -q "で待っています" "$D/tlog" 2> /dev/null; then break; fi
+        if ! kill -0 "$(cat "$TPID")" 2> /dev/null; then break; fi
+        j=$((j + 1))
+        sleep 0.1
+    done
+    if grep -q "で待っています" "$D/tlog" 2> /dev/null; then
+        TPORT=$i
+        break
+    fi
+    kill "$(cat "$TPID")" 2> /dev/null
+    : > "$TPID"
+    i=$((i + 1))
+done
+[ "$TPORT" -ne 0 ] || { echo "NG   残骸の試しのデーモンが立ちませんでした: $(cat "$D/tlog")"; exit 1; }
+
+# (c) ★生きている錠は --takeover でも壊さないこと。先に見ます
+#   （ここで壊れると、あとの (a) が「残骸が無い」で的を外します）
+# ★別の口で試します。その口が塞がっていたら、待ち受けで落ちて 3 になりません
+#   ＝この検査は**黙って通る形にはならず、落ちて見えます**。
+# ★--idle 1: 万一 立ってしまっても 1 秒で終わるように。付けないと止まります
+out=$("$YUID" "$FT" --write --takeover --idle 1 --port "$((TPORT + 15))" 2>&1)
+rc=$?
+check "★生きている錠は --takeover でも壊さないこと（終了コード）" "3" "$rc"
+has "錠を持っています" "$out" "そのとき、錠で断ったと言うこと"
+hasnt "片付けて建て直します" "$out" "★生きている錠を片付けたと言わないこと"
+kill -0 "$(cat "$TPID")" 2> /dev/null
+check "★持ち主がまだ生きていること（壊されていないこと）" "0" "$?"
+
+# ここから残骸を作ります。kill -9 は合図を渡さないので、錠が残ります
+TOLD=$(cat "$TPID")
+kill -9 "$TOLD" 2> /dev/null
+j=0
+while [ "$j" -lt 50 ]; do
+    kill -0 "$TOLD" 2> /dev/null || break
+    j=$((j + 1))
+    sleep 0.1
+done
+: > "$TPID"
+[ -f "$FT.錠" ]
+check "丁寧でない止め方では錠が残ること（＝常駐の落とし穴）" "0" "$?"
+
+# (a) 残骸があっても、旗が無ければ断ること
+out=$("$YUID" "$FT" --write --idle 1 --port "$TPORT" 2>&1)
+rc=$?
+check "残骸の錠があっても、旗なしでは断ること（終了コード）" "3" "$rc"
+has "--takeover を付けてください" "$out" "そのとき、常駐の口を教えること"
+
+# (b) 旗があれば片付けて立つこと
+"$YUID" "$FT" --write --takeover --port "$TPORT" --idle 600 > "$D/tlog2" 2>&1 &
+echo $! > "$TPID"
+j=0
+while [ "$j" -lt 50 ]; do
+    if grep -q "で待っています" "$D/tlog2" 2> /dev/null; then break; fi
+    if ! kill -0 "$(cat "$TPID")" 2> /dev/null; then break; fi
+    j=$((j + 1))
+    sleep 0.1
+done
+out=$(cat "$D/tlog2")
+has "残骸の錠を片付けて建て直します" "$out" "残骸なら、片付けたことを言うこと"
+has "pid=" "$out" "そのとき、どの錠を片付けたかを出すこと"
+has "で待っています" "$out" "★残骸のあとでも、--takeover なら立つこと"
+out=$("$SAY" "$TPORT" '一覧 (決定:)' 2>&1)
+has '"name":"常駐の試し"' "$out" "錠を片付けても、ファイルの中身は無事なこと"
+
+# 合図（SIGTERM）で止めると、錠が外れること。★--takeover が要らない道です
+kill "$(cat "$TPID")" 2> /dev/null
+j=0
+while [ "$j" -lt 50 ]; do
+    [ -f "$FT.錠" ] || break
+    j=$((j + 1))
+    sleep 0.1
+done
+[ -f "$FT.錠" ]
+check "★合図で止めると錠が外れること（丁寧な止め方なら残骸は出ない）" "1" "$?"
+: > "$TPID"
+
+# (d) ★別の機械が書いた錠は、pid が居なくても片付けないこと。
+#   その機械の pid はここから見られないので、「居ない」とは言えません。
+#   ★pid には、たったいま kill -9 した本物の pid を使います（確実に居ません）。
+#   こうすると、断る理由が「pid が居る」ではなく**機械の名前**だけに絞れます。
+printf 'yui-lock 1\nname=よその機械の結\nmachine=よその機械\npid=%s\nsince=1\ntag=0\n' "$TOLD" > "$FT.錠"
+out=$("$YUID" "$FT" --write --takeover --idle 1 --port "$TPORT" 2>&1)
+rc=$?
+check "★別の機械の錠は、pid が居なくても片付けないこと（終了コード）" "3" "$rc"
+hasnt "片付けて建て直します" "$out" "そのとき、片付けたと言わないこと"
+[ -f "$FT.錠" ]
+check "★そのとき錠が残っていること" "0" "$?"
+rm -f "$FT.錠"
 
 # ---------------------------------------------------------------- 締め
 

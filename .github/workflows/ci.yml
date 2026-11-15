@@ -341,7 +341,69 @@ jobs:
           $i = 0
           while ($i -lt 100 -and (Test-Path "w.yui.錠")) { Start-Sleep -Milliseconds 100; $i++ }
           Remove-Item "w.yui.錠" -ErrorAction SilentlyContinue
-          Write-Host "デーモン（段 1・段 2）: 通りました"
+
+          # ----------------------------------------- 残骸の錠（--takeover）
+          # ★ここは Windows でいちばん効きます。タスクスケジューラから常駐させると、
+          #   タスクの終了・ログオフで合図が渡らず、錠が残ります（上の段で実測済み）。
+          #   残骸が残ると次の自動起動が 3 で止まり、人が消すまで止まり続けます。
+          #   tests/daemon.sh は sh が要るので、ここを置かないと Windows では一度も通りません。
+          .\yui.exe tk.yui "作る (決定:常駐の試し)" | Out-Null
+          $t = Start-Process -FilePath ".\yuid.exe" `
+            -ArgumentList "tk.yui","--write","--port","39246" `
+            -PassThru -RedirectStandardError "tk.err" -NoNewWindow
+          $i = 0
+          while ($i -lt 100) {
+            if ((Test-Path "tk.err") -and (Get-Content "tk.err" -Raw) -match "で待っています") { break }
+            if ($t.HasExited) { break }
+            Start-Sleep -Milliseconds 100; $i++
+          }
+          if ((Get-Content "tk.err" -Raw) -notmatch "で待っています") {
+            throw "残骸の試しのデーモンが立ちません: $(Get-Content 'tk.err' -Raw)"
+          }
+
+          # ★(c) 生きている錠は --takeover でも壊さないこと。
+          #   いちばん危ない向きなので先に見ます（壊れても静かな側）。
+          # ★--idle 1: 万一 立ってしまっても 1 秒で終わるように（付けないと CI が止まります）
+          $live = (.\yuid.exe tk.yui --write --takeover --idle 1 --port 39247 2>&1 | Out-String)
+          if ($LASTEXITCODE -ne 3) {
+            throw "生きている錠を --takeover が壊しました（3 で断るべき）: $LASTEXITCODE / $live"
+          }
+          if ($live -match "片付けて建て直します") { throw "生きている錠を片付けたと言っています: $live" }
+          $global:LASTEXITCODE = 0
+          if ($t.HasExited) { throw "持ち主が落ちています（壊されています）" }
+
+          # ここから残骸を作ります。Stop-Process は合図を送らないので錠が残ります
+          Stop-Process -Id $t.Id
+          $i = 0
+          while ($i -lt 100 -and -not $t.HasExited) { Start-Sleep -Milliseconds 100; $i++ }
+          if (-not (Test-Path "tk.yui.錠")) { throw "丁寧でない止め方で錠が残っていません（この段の前提）" }
+
+          # ★(a) 旗が無ければ断り、常駐の口を教えること
+          $no = (.\yuid.exe tk.yui --write --idle 1 --port 39246 2>&1 | Out-String)
+          if ($LASTEXITCODE -ne 3) { throw "残骸があるのに 3 で断っていません: $LASTEXITCODE / $no" }
+          if ($no -notmatch "--takeover を付けてください") { throw "常駐の口を教えていません: $no" }
+          $global:LASTEXITCODE = 0
+
+          # ★(b) 旗があれば片付けて立ち、ファイルの中身は無事であること
+          $t2 = Start-Process -FilePath ".\yuid.exe" `
+            -ArgumentList "tk.yui","--write","--takeover","--port","39246" `
+            -PassThru -RedirectStandardError "tk2.err" -NoNewWindow
+          $i = 0
+          while ($i -lt 100) {
+            if ((Test-Path "tk2.err") -and (Get-Content "tk2.err" -Raw) -match "で待っています") { break }
+            if ($t2.HasExited) { break }
+            Start-Sleep -Milliseconds 100; $i++
+          }
+          $tl = Get-Content "tk2.err" -Raw
+          if ($tl -notmatch "残骸の錠を片付けて建て直します") { throw "片付けたと言っていません: $tl" }
+          if ($tl -notmatch "で待っています") { throw "残骸のあとに立っていません: $tl" }
+          $out = (.\yuid_say.exe 39246 "一覧 (決定:)" | Out-String)
+          if ($out -notmatch '"name":"常駐の試し"') { throw "錠を片付けたら中身が変わりました: $out" }
+          Stop-Process -Id $t2.Id
+          $i = 0
+          while ($i -lt 100 -and (Test-Path "tk.yui.錠")) { Start-Sleep -Milliseconds 100; $i++ }
+          Remove-Item "tk.yui.錠" -ErrorAction SilentlyContinue
+          Write-Host "デーモン（段 1・段 2・残骸の錠）: 通りました"
 
       - name: 土台をまたぐ比較用のファイルを作る
         run: type tests\compat.txt | .\yui.exe compat.yui

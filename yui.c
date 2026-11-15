@@ -23,6 +23,7 @@
 #ifdef _WIN32
 #  include "yui_win.h" /* Windows 用の受け皿。POSIX の低水準 I/O を置き換えます */
 #else
+#  include <signal.h> /* kill(pid, 0)。pid がまだ居るかを測ります */
 #  include <sys/file.h>
 #  include <sys/stat.h>
 #  include <unistd.h>
@@ -3367,6 +3368,93 @@ int yui_lock_owner(const char *path, char *buf, size_t bufn) {
     free(lpath);
     if (rc < 0) return YUI_ERROR;
     return YUI_OK; /* 錠が無ければ buf は空のまま */
+}
+
+/*
+ * pid がまだ居るか。1 = 居る、0 = 居ない、-1 = 測れない。
+ * ★-1 と 0 を混ぜないこと。混ぜると「測れない」が「居ない」に化け、
+ *   生きている錠を壊す側へ倒れます。
+ * ★wasm では作りません（下の yui_lock_stale が pid を見る前に返るので、
+ *   作ると「呼ばれない関数」になります）。
+ */
+#ifndef __EMSCRIPTEN__
+static int pid_alive(unsigned long pid) {
+    if (pid == 0) return -1;
+#ifdef _WIN32
+    {
+        HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, (DWORD)pid);
+        DWORD code = 0;
+        if (!h) {
+            /* ★居ないときだけ ERROR_INVALID_PARAMETER です。ほかは分かりません */
+            return GetLastError() == ERROR_INVALID_PARAMETER ? 0 : -1;
+        }
+        /* ★終わった直後のプロセスはまだ開けます。終了コードが入っていれば居ません */
+        if (GetExitCodeProcess(h, &code) && code != STILL_ACTIVE) {
+            CloseHandle(h);
+            return 0;
+        }
+        CloseHandle(h);
+        return 1;
+    }
+#else
+    if (kill((pid_t)pid, 0) == 0) return 1;
+    return errno == ESRCH ? 0 : -1; /* EPERM は「別の人のものが居る」 */
+#endif
+}
+#endif /* __EMSCRIPTEN__ でない */
+
+/* 錠の本文から 行頭の key= の値を取ります。1 = 取れた */
+static int lock_field(const char *body, const char *key, char *out, size_t n) {
+    size_t klen = strlen(key);
+    const char *p = body;
+    out[0] = 0;
+    while (p && *p) {
+        if (strncmp(p, key, klen) == 0 && p[klen] == '=') {
+            const char *v = p + klen + 1;
+            const char *e = strchr(v, 10); /* 改行 */
+            size_t len = e ? (size_t)(e - v) : strlen(v);
+            if (len >= n) len = n - 1;
+            memcpy(out, v, len);
+            out[len] = 0;
+            while (len > 0 && out[len - 1] == 13) out[--len] = 0; /* 復帰を落とす */
+            return 1;
+        }
+        p = strchr(p, 10);
+        if (p) p++;
+    }
+    return 0;
+}
+
+int yui_lock_stale(const char *path, int *out) {
+    char body[1024], mach[256], mine[256], pidbuf[64];
+    if (!out) return YUI_ERROR;
+    *out = 0;
+    if (yui_lock_owner(path, body, sizeof body) != YUI_OK) return YUI_ERROR;
+    if (!body[0]) return YUI_OK; /* 錠が無い */
+    if (!lock_field(body, "machine", mach, sizeof mach)) return YUI_OK;
+    if (!lock_field(body, "pid", pidbuf, sizeof pidbuf)) return YUI_OK;
+    lock_machine(mine, sizeof mine);
+    /* ★別の機械のものは測りません。そこの pid はここから見られません */
+    if (!mine[0] || !mach[0] || strcmp(mine, mach) != 0) return YUI_OK;
+#ifdef __EMSCRIPTEN__
+    /* ★wasm の machine は両方 "wasm" で、上の照合が偽の一致を返します。
+     *   pid を測れるかとは別に、ここで止めます */
+    return YUI_OK;
+#else
+    if (pid_alive(strtoul(pidbuf, NULL, 10)) == 0) *out = 1;
+    return YUI_OK;
+#endif
+}
+
+int yui_lock_clear(const char *path) {
+    char *lpath;
+    int rc;
+    if (!path || !*path) return YUI_ERROR;
+    lpath = lock_path_of(path);
+    rc = remove(lpath);
+    free(lpath);
+    if (rc != 0 && errno != ENOENT) return YUI_ERROR;
+    return YUI_OK;
 }
 
 /* 器を作るところだけ。開くのは open_body です */
