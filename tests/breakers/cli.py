@@ -64,6 +64,33 @@ BREAKS = [
         "yui.c",
         [("    if (CMDS[i].writes && db->readonly) {", "    if (0) {")],
     ),
+    # ★JSON で端の点の属性を出すのをやめる＝,"attrs":{} という嘘に戻る。
+    #   3 経路あるので 3 つ。1 つだけ置くと、残りは「在るのに守っていない」になる。
+    (
+        'JSON の線の行が端の点の属性を出さない（"attrs":{} の嘘に戻る）',
+        "yui.c",
+        [("    json_node_body(db, o, e->from, sh); /* ★JSON は端の点も出します（上の理由） */",
+          "    json_node_body(db, o, e->from, node_show(sh));")],
+    ),
+    (
+        'JSON の道の行が端の点の属性を出さない',
+        "yui.c",
+        [("        json_node_body(db, o, start, sh); /* ★JSON は端の点も出します */",
+          "        json_node_body(db, o, start, node_show(sh));")],
+    ),
+    (
+        # ★start とは別の行。これが無いと「行き先の点」の検査が守られていない
+        'JSON の道の行が、2 つ目以降の点の属性を出さない',
+        "yui.c",
+        [("            json_node_body(db, o, nodes.v[i - 1], sh);",
+          "            json_node_body(db, o, nodes.v[i - 1], node_show(sh));")],
+    ),
+    (
+        'JSON のつながりの行が相手の点の属性を出さない',
+        "yui.c",
+        [("        json_node_body(db, o, other, &SHOW_ALL); /* ★JSON は相手の点も出します */",
+          "        json_node_body(db, o, other, &NONE);")],
+    ),
 ]
 
 

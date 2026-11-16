@@ -264,18 +264,27 @@ typedef struct {
     size_t nkeys;
 } Show;
 static const Show SHOW_ALL = {1, NULL, 0};
-/* 属性を 1 つも出さない指示。線の行の両端の点などに使う */
+/* 属性を 1 つも出さない指示。人が読む形の、線の行の両端の点などに使う */
 static const Show NONE = {0, NULL, 0};
 
 /*
  * 線の行（探す）や道の行（辿る）に出てくる点の属性をどう出すか。
+ * ★これは人が読む形だけの指示です。JSON は下の理由で、いつも出します。
  *
- * ★既定では出しません。線や道が主役の行で点の属性まで並べると、
+ * ★人が読む形では既定で出しません。線や道が主役の行で点の属性まで並べると、
  *   1 行が長くなって形が読めなくなります。
  * ★ただし 見せる で名前を挙げたときは、その属性だけ点にも出します。
  *   「ある日のやり取りを、時刻と話者つきで並べる」が
  *   辿る 1 本で書けるようにするためです。
  * ★名前だけ のときは nkeys=0 なので、やはり何も出ません。
+ *
+ * ★★JSON でこれを使ってはいけません。JSON は属性を ,"attrs":{…} という
+ *   鍵で出すので、出さないと **"attrs":{} ＝「属性は無い」と断定** します。
+ *   人が読む形は「書いていないだけ」で済みますが、JSON は嘘になります。
+ *   実際に、使う側が「結ぶ では属性が入らない」と読み違えました
+ *   （入っていて、出していなかっただけ）。読むのは別の Claude なので、
+ *   「鍵が無い」と「{} が来た」を読み分けさせるのは事故のもとです。
+ *   ⇒ JSON の端の点は sh をそのまま渡します（2026-11-17・使う側と相談して決着）。
  */
 static const Show *node_show(const Show *sh) { return sh->all ? &NONE : sh; }
 
@@ -1353,9 +1362,9 @@ static void json_edge(yui *db, Str *o, u64 id, const Show *sh) {
     str_add(o, "{\"kind\":\"edge\",\"type\":");
     json_str(o, e->type);
     str_add(o, ",\"from\":{");
-    json_node_body(db, o, e->from, node_show(sh));
+    json_node_body(db, o, e->from, sh); /* ★JSON は端の点も出します（上の理由） */
     str_add(o, "},\"to\":{");
-    json_node_body(db, o, e->to, node_show(sh));
+    json_node_body(db, o, e->to, sh);
     str_chr(o, '}');
     json_attrs(o, e->attrs, e->nattrs, sh);
     str_chr(o, '}');
@@ -2061,7 +2070,7 @@ static void emit_link(yui *db, Str *o, const Edge *e, int forward, u64 other) {
         json_str(o, e->type);
         json_attrs(o, e->attrs, e->nattrs, &SHOW_ALL);
         str_add(o, ",\"other\":{");
-        json_node_body(db, o, other, &NONE);
+        json_node_body(db, o, other, &SHOW_ALL); /* ★JSON は相手の点も出します */
         str_add(o, "}}");
         emit_raw(db, YUI_ROW, o->p ? o->p : "");
         str_clear(o);
@@ -2208,11 +2217,11 @@ static void print_path(yui *db, Str *o, u64 start, u64 last_node, u64 edge, u64 
         /* ★道は点と線の並びとして出します。nodes は edges より 1 つ多いです。
          *   forward は、その線をどちら向きに通ったかです（人が読む形の -> と <- に当たります）。 */
         str_add(o, "{\"kind\":\"path\",\"nodes\":[{");
-        json_node_body(db, o, start, node_show(sh));
+        json_node_body(db, o, start, sh); /* ★JSON は端の点も出します */
         str_chr(o, '}');
         for (i = nodes.n; i > 0; i--) {
             str_add(o, ",{");
-            json_node_body(db, o, nodes.v[i - 1], node_show(sh));
+            json_node_body(db, o, nodes.v[i - 1], sh);
             str_chr(o, '}');
         }
         str_add(o, "],\"edges\":[");
