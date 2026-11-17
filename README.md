@@ -435,7 +435,30 @@ Register-ScheduledTask -TaskName "yui-daemon" -Action $act -Trigger $trg -Settin
   対照（2026-11-15・Windows 11 Pro 26300 で実測）: `-User` なし → 拒否、`-User` あり → `State=Ready`
 - ★**`-ExecutionTimeLimit` を 0 にすること。**既定は 3 日で、黙って切られます
 - ★**`cmd.exe` を挟むのは、標準エラーを残すためだけです。**タスクスケジューラは出力を捕まえません
-- 止めるのは `Stop-ScheduledTask -TaskName "yui-daemon"`、消すのは `Unregister-ScheduledTask`
+- ★★**`Stop-ScheduledTask` ではデーモンが止まりません。**タスクが終わらせるのは `cmd.exe` だけで、
+  その子の `yuid.exe` は**孤児として残り、口（ポート）と `<パス>.錠` を持ち続けます。**
+  ★**それでいてタスクの側は `State=Ready` / `LastTaskResult=267014`（＝利用者が終了させた）になるので、
+  「止まった」と読めます。**そのあと `Start-ScheduledTask` すると、残っている側が口を持っているので
+  新しいほうが `rc=3` で終わり、**「立たない」ように見えます**（実は古いほうが元気に動いています）。
+  ⇒ 止めるときは**錠に書かれている pid を指します。**打つ 3 行:
+
+  ```powershell
+  Stop-ScheduledTask -TaskName "yui-daemon"
+  # ★$pid は PowerShell が持っている変数なので使えません（書き込めずに落ちます）
+  $owner = (Select-String -Path "C:\…\記憶.yui.錠" -Pattern '^pid=(\d+)').Matches.Groups[1].Value
+  if (Get-Process -Id $owner -ErrorAction SilentlyContinue) { Stop-Process -Id $owner -Force }
+  ```
+
+  実測（2026-11-17・Windows 11 Pro 26300・使い捨てのタスクで対照を取った）:
+
+  | やったこと | デーモン | 口 | 錠 |
+  |---|---|---|---|
+  | `Stop-ScheduledTask` だけ | ★**生きている** | ★**待ち受けたまま** | 残る |
+  | 続けて錠の pid を `Stop-Process` | 居なくなった | 空いた | 残る |
+  | そのあと `Start-ScheduledTask` | `--takeover` が残骸を片付けて立った | 待ち受け | 書き直された |
+
+  ★**この止め方は合図を渡さないので、錠は残ります**（上の表のとおり）。`--takeover` を付けてあれば次の起動で片付きます。
+- 消すのは `Unregister-ScheduledTask`。★**先に上の 3 行で止めてください。**タスクを消してもデーモンは残ります
 - ★**立ったかどうかは、ログの「で待っています」の行で見てください。**タスクが「実行中」でも、錠で断られて終わっていることがあります
 - ★★**ただし「で待っています」だけでは、正しいファイルに繋がった証拠になりません。**
   デーモンは**無いファイルを作ってから立つ**ので、**パスを 1 文字 間違えても、空の蔵で元気にその行を出します。**
