@@ -184,8 +184,8 @@ BREAKS = [
         [
             (
                 "yui.c",
-                "    if (pid_alive(strtoul(pidbuf, NULL, 10)) == 0) *out = 1;",
-                "    *out = 1;",
+                "    *out = pid_alive(strtoul(pidbuf, NULL, 10)) == 0 ? YUI_LOOK_STALE : YUI_LOOK_LIVE;",
+                "    *out = YUI_LOOK_STALE;\n    (void)pidbuf;",
             ),
         ],
     ),
@@ -194,8 +194,72 @@ BREAKS = [
         [
             (
                 "yui.c",
-                "    if (!mine[0] || !mach[0] || strcmp(mine, mach) != 0) return YUI_OK;",
-                "    if (0) return YUI_OK;",
+                "    if (!mine[0] || !mach[0] || strcmp(mine, mach) != 0) {\n"
+                "        *out = YUI_LOOK_OTHER;\n        return YUI_OK;\n    }",
+                "    if (0 && (!mine[0] || !mach[0] || strcmp(mine, mach) != 0)) {\n"
+                "        *out = YUI_LOOK_OTHER;\n        return YUI_OK;\n    }",
+            ),
+        ],
+    ),
+    (
+        # ★ここから 5 件が os= の側。Windows と WSL は機械の名前まで同じになるので、
+        #   名前だけの照合では「向こうで生きている錠」を残骸と測ります。
+        '★錠に os= を書かない（Windows と WSL を分ける手がかりが消える）',
+        [
+            (
+                "yui.c",
+                '    snprintf(line, sizeof line, "os=%s\\n", osv);',
+                '    snprintf(line, sizeof line, "x-os=%s\\n", osv);',
+            ),
+        ],
+    ),
+    (
+        '★別の土台（os=）の錠も片付ける（土台を照合しない）',
+        [
+            (
+                "yui.c",
+                "    if (!myos[0] || !osv[0] || strcmp(myos, osv) != 0) {\n"
+                "        *out = YUI_LOOK_OTHER;\n        return YUI_OK;\n    }",
+                "    if (0 && (!myos[0] || !osv[0] || strcmp(myos, osv) != 0)) {\n"
+                "        *out = YUI_LOOK_OTHER;\n        return YUI_OK;\n    }",
+            ),
+        ],
+    ),
+    (
+        '★os= が無い錠を自分のものと見なす（古い版の錠を残骸と測る）',
+        [
+            (
+                "yui.c",
+                '    if (!lock_field(body, "os", osv, sizeof osv)) {\n'
+                "        *out = YUI_LOOK_OLD;\n        return YUI_OK;\n    }",
+                '    if (!lock_field(body, "os", osv, sizeof osv)) {\n'
+                "        lock_os(osv, sizeof osv); /* 壊した */\n    }",
+            ),
+        ],
+    ),
+    (
+        '★別の土台の錠にも --takeover を勧める（手で錠を消す道へ進ませる）',
+        [
+            (
+                'fputs("yuid: ★この錠は別の機械か別の土台（Windows と WSL など）のものです。"\n'
+                '              "--takeover でも片付きません\\n"\n'
+                '              "yuid: ★手で消さないでください。向こうで生きているかもしれず、"\n'
+                '              "ここからは測れません。止めるのは持ち主の側です\\n", stderr);',
+                'fputs("yuid: ★残骸かもしれません。常駐させるなら --takeover を"\n'
+                '              "付けてください（生きている錠は片付けません）\\n", stderr);',
+            ),
+        ],
+    ),
+    (
+        '★os= が無い錠にも --takeover を勧める（同じく手で消す道）',
+        [
+            (
+                'fputs("yuid: ★この錠には os= が在りません（os= を書く前の版が書いた錠です）。"\n'
+                '              "どの土台のものか分からないので片付けません\\n"\n'
+                '              "yuid: ★持ち主が居ないことを確かめてから、錠のファイルを消してください\\n",\n'
+                "              stderr);",
+                'fputs("yuid: ★残骸かもしれません。常駐させるなら --takeover を"\n'
+                '              "付けてください（生きている錠は片付けません）\\n", stderr);',
             ),
         ],
     ),
@@ -221,8 +285,12 @@ BREAKS = [
         '残骸かもしれないときに、常駐の口（--takeover）を教えない',
         [
             (
-                "            if (busy && !takeover)",
-                "            if (0)",
+                # ★takeover を残して参照する（消すと -Wextra の「使っていない引数」になり、
+                #   ビルド不能＝壊せていない と混ざる）
+                "        if (!takeover)\n"
+                '            fputs("yuid: ★残骸かもしれません。常駐させるなら --takeover を"',
+                "        if (0 && !takeover)\n"
+                '            fputs("yuid: ★残骸かもしれません。常駐させるなら --takeover を"',
             ),
         ],
     ),

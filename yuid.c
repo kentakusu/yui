@@ -778,14 +778,50 @@ static void usage(const char *me) {
             "              押さずに書くなら「名乗る <名前> 印なし」。\n"
             "  --max-stamp 1 つの文で帰属を押す相手の上限（既定 %d・検査のため）\n"
             "  --takeover  残骸の錠を片付けて建て直します（常駐させるとき）。\n"
-            "              ★片付けるのは「この機械が書いた錠で、pid が居ない」ときだけ。\n"
-            "              生きている錠と、別の機械の錠は片付けません（3 で断ります）。\n"
+            "              ★片付けるのは「この機械・この土台が書いた錠で、pid が居ない」\n"
+            "              ときだけ。生きている錠・別の機械の錠・別の土台（Windows と\n"
+            "              WSL など）の錠・os= が無い錠は片付けません（3 で断ります）。\n"
             "  --port      既定 %d\n"
             "  --idle      誰も繋いでいない状態がこの秒数 続いたら終わります（既定 0＝終わらない）\n"
             "  --max-rows  1 回の問い合わせで返す行の上限（既定 %d・0 で外す）\n"
             "              ★超えたら打ち切り、end に cut を付けて言います\n"
             "  --max-out   受け取らない接続を切るまでの溜まり（バイト・既定 %lu）\n",
             me, STAMP_MAX, DEFAULT_PORT, DEFAULT_MAX_ROWS, (unsigned long)DEFAULT_MAX_OUT);
+}
+
+/*
+ * 錠で断ったときの助言。★見立てごとに別の文にします。
+ *   どの見立てでも「--takeover を付けて」と言うと、付けても断られた人が
+ *   **錠のファイルを手で消す**ほうへ進みます。そこがいちばん危ない道です
+ *   （向こうで生きている持ち主の錠が消え、2 つが同じファイルに書きます）。
+ */
+static void lock_advice(int look, int takeover, const char *path) {
+    char body[1024];
+    if (look == YUI_LOOK_STALE) {
+        /* ★ここだけが --takeover で片付く見立てです */
+        if (!takeover)
+            fputs("yuid: ★残骸かもしれません。常駐させるなら --takeover を"
+                  "付けてください（生きている錠は片付けません）\n", stderr);
+        return;
+    }
+    if (look == YUI_LOOK_LIVE) {
+        fputs("yuid: ★持ち主がまだ居ます。--takeover でも片付きません。"
+              "先に持ち主を止めてください（下の pid）\n", stderr);
+    } else if (look == YUI_LOOK_OTHER) {
+        fputs("yuid: ★この錠は別の機械か別の土台（Windows と WSL など）のものです。"
+              "--takeover でも片付きません\n"
+              "yuid: ★手で消さないでください。向こうで生きているかもしれず、"
+              "ここからは測れません。止めるのは持ち主の側です\n", stderr);
+    } else if (look == YUI_LOOK_OLD) {
+        fputs("yuid: ★この錠には os= が在りません（os= を書く前の版が書いた錠です）。"
+              "どの土台のものか分からないので片付けません\n"
+              "yuid: ★持ち主が居ないことを確かめてから、錠のファイルを消してください\n",
+              stderr);
+    } else {
+        return;
+    }
+    /* ★誰のものかを出します。消すかを決めるのは人なので、材料を渡します */
+    if (yui_lock_owner(path, body, sizeof body) == YUI_OK && body[0]) fputs(body, stderr);
 }
 
 int main(int argc, char **argv) {
@@ -955,11 +991,11 @@ int main(int argc, char **argv) {
                 return busy2 ? 3 : 1;
             }
         } else {
+            int look = YUI_LOOK_NONE;
             fprintf(stderr, "yuid: %s\n", yui_errmsg(db));
-            /* ★断ったままにするなら、常駐の口が在ることを言います */
-            if (busy && !takeover)
-                fputs("yuid: ★残骸かもしれません。常駐させるなら --takeover を"
-                      "付けてください（生きている錠は片付けません）\n", stderr);
+            /* ★助言は見立てごとに分けます（lock_advice に理由） */
+            if (busy && yui_lock_look(path, &look) == YUI_OK)
+                lock_advice(look, takeover, path);
             yui_close(db);
             sock_close(lis);
             return busy ? 3 : 1;

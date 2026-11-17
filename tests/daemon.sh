@@ -552,6 +552,15 @@ while [ "$i" -lt 39300 ]; do
 done
 [ "$TPORT" -ne 0 ] || { echo "NG   残骸の試しのデーモンが立ちませんでした: $(cat "$D/tlog")"; exit 1; }
 
+# ★この土台の os= と machine= は、本物の錠から読みます。
+#   手で書くと、別の土台で走らせた日に**偽の一致**を作って検出力が消えます。
+MYOS=$(sed -n 's/^os=//p' "$FT.錠" | head -1)
+MYMACH=$(sed -n 's/^machine=//p' "$FT.錠" | head -1)
+[ -n "$MYOS" ]
+check "★錠に os= を書くこと（machine= だけでは Windows と WSL を分けられない）" "0" "$?"
+[ -n "$MYMACH" ]
+check "錠に machine= を書くこと" "0" "$?"
+
 # (c) ★生きている錠は --takeover でも壊さないこと。先に見ます
 #   （ここで壊れると、あとの (a) が「残骸が無い」で的を外します）
 # ★別の口で試します。その口が塞がっていたら、待ち受けで落ちて 3 になりません
@@ -616,12 +625,52 @@ check "★合図で止めると錠が外れること（丁寧な止め方なら�
 # (d) ★別の機械が書いた錠は、pid が居なくても片付けないこと。
 #   その機械の pid はここから見られないので、「居ない」とは言えません。
 #   ★pid には、たったいま kill -9 した本物の pid を使います（確実に居ません）。
-#   こうすると、断る理由が「pid が居る」ではなく**機械の名前**だけに絞れます。
-printf 'yui-lock 1\nname=よその機械の結\nmachine=よその機械\npid=%s\nsince=1\ntag=0\n' "$TOLD" > "$FT.錠"
+#   ★os= はこの土台のものを書きます。付けないと断る理由が os= の側に移り、
+#     **機械の名前の照合を 1 度も通らなくなります**（名前が嘘になる）。
+printf 'yui-lock 1\nname=よその機械の結\nmachine=よその機械\nos=%s\npid=%s\nsince=1\ntag=0\n' "$MYOS" "$TOLD" > "$FT.錠"
 out=$("$YUID" "$FT" --write --takeover --idle 1 --port "$TPORT" 2>&1)
 rc=$?
 check "★別の機械の錠は、pid が居なくても片付けないこと（終了コード）" "3" "$rc"
 hasnt "片付けて建て直します" "$out" "そのとき、片付けたと言わないこと"
+[ -f "$FT.錠" ]
+check "★そのとき錠が残っていること" "0" "$?"
+rm -f "$FT.錠"
+
+# (e) ★機械の名前が同じでも、別の土台（os=）の錠は片付けないこと。
+#   Windows と WSL2 は同じファイルを見られて、★機械の名前まで同じになります
+#   （WSL の既定のホスト名は Windows の計算機名）。それでも pid は別の番号です。
+#   ⇒ 名前だけで照合すると、**向こうで生きているプロセスの錠を「残骸」と測り**、
+#     --takeover が片付けて、2 つが同じファイルに書きます。
+#   ★ここでも pid は kill -9 した本物の pid（この土台では確実に居ません）。
+#     こうすると、断る理由が os= だけに絞れます。
+printf 'yui-lock 1\nname=よその土台の結\nmachine=%s\nos=べつの土台\npid=%s\nsince=1\ntag=0\n' "$MYMACH" "$TOLD" > "$FT.錠"
+out=$("$YUID" "$FT" --write --takeover --idle 1 --port "$TPORT" 2>&1)
+rc=$?
+check "★同じ機械の名前でも、別の土台の錠は片付けないこと（終了コード）" "3" "$rc"
+hasnt "片付けて建て直します" "$out" "そのとき、片付けたと言わないこと"
+[ -f "$FT.錠" ]
+check "★そのとき錠が残っていること" "0" "$?"
+
+# (e2) ★そのとき、助言で --takeover を勧めないこと。
+#   勧めると、付けても断られた人が**錠を手で消す**ほうへ進みます。
+#   それが「向こうで生きている持ち主の錠を消す」道です。
+out=$("$YUID" "$FT" --write --idle 1 --port "$TPORT" 2>&1)
+rc=$?
+check "別の土台の錠は、旗なしでも 3 で断ること" "3" "$rc"
+hasnt "--takeover を付けてください" "$out" "★別の土台の錠に --takeover を勧めないこと"
+has "別の機械か別の土台" "$out" "そのとき、なぜ片付けられないかを言うこと"
+has "手で消さないでください" "$out" "★手で消す道へ進ませないこと"
+rm -f "$FT.錠"
+
+# (f) ★os= が無い錠（os= を書く前の版が書いたもの）も片付けないこと。
+#   どの土台のものか分からないので、残骸とは言えません。
+printf 'yui-lock 1\nname=古い版の結\nmachine=%s\npid=%s\nsince=1\ntag=0\n' "$MYMACH" "$TOLD" > "$FT.錠"
+out=$("$YUID" "$FT" --write --takeover --idle 1 --port "$TPORT" 2>&1)
+rc=$?
+check "★os= が無い錠は片付けないこと（終了コード）" "3" "$rc"
+hasnt "片付けて建て直します" "$out" "そのとき、片付けたと言わないこと"
+has "os= が在りません" "$out" "そのとき、何が足りないのかを言うこと"
+hasnt "--takeover を付けてください" "$out" "★os= が無い錠に --takeover を勧めないこと"
 [ -f "$FT.錠" ]
 check "★そのとき錠が残っていること" "0" "$?"
 rm -f "$FT.錠"

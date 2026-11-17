@@ -3181,6 +3181,30 @@ static void lock_machine(char *buf, size_t n) {
 }
 
 /*
+ * 土台の名前。★機械の名前とは別に要ります。
+ * Windows と WSL2 は**同じファイルを見られる**のに pid は別の番号で、
+ * しかも WSL の既定のホスト名は Windows の計算機名と同じです。
+ * ⇒ 機械の名前だけで照合すると、**向こうで生きている錠を「残骸」と測ります。**
+ * ★値は増えることがあります。知らない値は「自分のものではない」と読んでください。
+ */
+static void lock_os(char *buf, size_t n) {
+    const char *v;
+#ifdef _WIN32
+    v = "win";
+#elif defined(__EMSCRIPTEN__)
+    v = "wasm";
+#elif defined(__APPLE__)
+    v = "mac";
+#elif defined(__linux__)
+    v = "linux";
+#else
+    v = "posix";
+#endif
+    buf[0] = 0;
+    if (n > strlen(v)) memcpy(buf, v, strlen(v) + 1);
+}
+
+/*
  * 名乗りから制御文字を抜きます。
  * ★改行が入ると錠の形が壊れるので、必ずここを通します。
  */
@@ -3291,7 +3315,7 @@ static u64 lock_tag(void) {
 
 /* 錠の中身。★キーは ASCII です（機械で読む側のため） */
 static void lock_body(Str *s, const char *name, u64 tag) {
-    char mach[256], nm[256], line[600], when[64];
+    char mach[256], nm[256], osv[32], line[600], when[64];
     time_t now = time(NULL);
     struct tm *lt = localtime(&now);
     lock_machine(mach, sizeof mach);
@@ -3300,6 +3324,10 @@ static void lock_body(Str *s, const char *name, u64 tag) {
     snprintf(line, sizeof line, "name=%s\n", nm);
     str_add(s, line);
     snprintf(line, sizeof line, "machine=%s\n", mach);
+    str_add(s, line);
+    lock_os(osv, sizeof osv);
+    /* ★machine= だけでは Windows と WSL を分けられません（lock_os に理由） */
+    snprintf(line, sizeof line, "os=%s\n", osv);
     str_add(s, line);
     snprintf(line, sizeof line, "pid=%lu\n", (unsigned long)getpid());
     str_add(s, line);
@@ -3434,25 +3462,64 @@ static int lock_field(const char *body, const char *key, char *out, size_t n) {
     return 0;
 }
 
-int yui_lock_stale(const char *path, int *out) {
-    char body[1024], mach[256], mine[256], pidbuf[64];
+int yui_lock_look(const char *path, int *out) {
+    char body[LOCK_READ_MAX], mach[256], mine[256], osv[64], myos[64], pidbuf[64];
     if (!out) return YUI_ERROR;
-    *out = 0;
+    *out = YUI_LOOK_NONE;
     if (yui_lock_owner(path, body, sizeof body) != YUI_OK) return YUI_ERROR;
     if (!body[0]) return YUI_OK; /* 錠が無い */
-    if (!lock_field(body, "machine", mach, sizeof mach)) return YUI_OK;
-    if (!lock_field(body, "pid", pidbuf, sizeof pidbuf)) return YUI_OK;
+    /*
+     * ★ここから先は、分からないものを全部「片付けない側」へ倒します。
+     *   読めない錠を残骸と呼ぶと、生きている持ち主の錠を壊します。
+     */
+    if (!lock_field(body, "pid", pidbuf, sizeof pidbuf)) {
+        *out = YUI_LOOK_OTHER;
+        return YUI_OK;
+    }
+    if (!lock_field(body, "machine", mach, sizeof mach)) {
+        *out = YUI_LOOK_OTHER;
+        return YUI_OK;
+    }
+    /* ★os= が無いのは、os= を書く前の版が書いた錠です。どの土台のものか分かりません */
+    if (!lock_field(body, "os", osv, sizeof osv)) {
+        *out = YUI_LOOK_OLD;
+        return YUI_OK;
+    }
+    lock_os(myos, sizeof myos);
     lock_machine(mine, sizeof mine);
+    /*
+     * ★土台を先に見ます。機械の名前より強い条件です。
+     *   Windows と WSL2 は同じファイルを見られて、機械の名前まで同じになる
+     *   （WSL の既定のホスト名は Windows の計算機名）のに、pid は別の番号です。
+     */
+    if (!myos[0] || !osv[0] || strcmp(myos, osv) != 0) {
+        *out = YUI_LOOK_OTHER;
+        return YUI_OK;
+    }
     /* ★別の機械のものは測りません。そこの pid はここから見られません */
-    if (!mine[0] || !mach[0] || strcmp(mine, mach) != 0) return YUI_OK;
+    if (!mine[0] || !mach[0] || strcmp(mine, mach) != 0) {
+        *out = YUI_LOOK_OTHER;
+        return YUI_OK;
+    }
 #ifdef __EMSCRIPTEN__
-    /* ★wasm の machine は両方 "wasm" で、上の照合が偽の一致を返します。
-     *   pid を測れるかとは別に、ここで止めます */
-    return YUI_OK;
+    /* ★wasm は os も machine も両方 "wasm" で、上の照合が偽の一致を返します。
+     *   pid を測る手段も無いので、「持ち主が居る」側に倒します */
+    *out = YUI_LOOK_LIVE;
 #else
-    if (pid_alive(strtoul(pidbuf, NULL, 10)) == 0) *out = 1;
-    return YUI_OK;
+    /* ★-1（測れない）を 0（居ない）と混ぜないこと。混ぜると生きている錠を壊します */
+    *out = pid_alive(strtoul(pidbuf, NULL, 10)) == 0 ? YUI_LOOK_STALE : YUI_LOOK_LIVE;
 #endif
+    return YUI_OK;
+}
+
+/* ★見立ての正は yui_lock_look です。こちらはその短い書き方です */
+int yui_lock_stale(const char *path, int *out) {
+    int look = YUI_LOOK_NONE;
+    if (!out) return YUI_ERROR;
+    *out = 0;
+    if (yui_lock_look(path, &look) != YUI_OK) return YUI_ERROR;
+    *out = look == YUI_LOOK_STALE;
+    return YUI_OK;
 }
 
 int yui_lock_clear(const char *path) {
