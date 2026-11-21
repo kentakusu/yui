@@ -733,10 +733,21 @@ check "合言葉のファイルが無いときに立たないこと" "2" "$rc"
 LANADDR=""
 LPORT=0
 i=39240
-for cand in 127.0.0.2 $(hostname -I 2> /dev/null) $(ipconfig getifaddr en0 2> /dev/null); do
+# ★探し方を広く取ります。127.0.0.2 は Linux では取れますが、★macOS では取れません
+#   （CI の macOS で実測。それだけだと門を 1 件も見られませんでした）。
+#   だから ifconfig / ip からも拾います。どちらか片方しか無い土台があるので両方 書きます。
+for cand in 127.0.0.2 \
+    $(hostname -I 2> /dev/null) \
+    $(ipconfig getifaddr en0 2> /dev/null) \
+    $(ifconfig 2> /dev/null | sed -n 's/^[ 	]*inet \([0-9.]*\).*/\1/p' | grep -v '^127\.') \
+    $(ip -4 -o addr 2> /dev/null | awk '{print $4}' | cut -d/ -f1 | grep -v '^127\.'); do
     [ -n "$cand" ] || continue
     [ "$cand" = "127.0.0.1" ] && continue
-    while [ "$i" -lt 39258 ]; do
+    # ★1 つの候補で口の範囲を使い切らないように、候補あたり 3 回までにします
+    #   （使い切ると、あとの候補が 1 回も試されません）
+    tries=0
+    while [ "$i" -lt 39258 ] && [ "$tries" -lt 3 ]; do
+        tries=$((tries + 1))
         "$YUID" "$S3" --write --lan "$cand" --secret-file "$SEC" --port "$i" --idle 600 \
             > "$D/log3" 2>&1 &
         echo $! > "$D/pid3"
