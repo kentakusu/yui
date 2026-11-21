@@ -675,6 +675,136 @@ hasnt "--takeover を付けてください" "$out" "★os= が無い錠に --tak
 check "★そのとき錠が残っていること" "0" "$?"
 rm -f "$FT.錠"
 
+# ------------------------------------------------- 段 3: LAN の口と合言葉
+#
+# 設計の正は docs/デーモンの構想.md の「口」の表です。
+#   127.0.0.1 … 合言葉 不要 ／ LAN のアドレス … ★合言葉 必須
+# 合言葉を必須にする理由は privacy で、★口が開いていれば同じ LAN に居る
+# 誰でも全部 読めるからです。だから「読むこと」も門の内側に置きます。
+
+S3="$D/s3.yui"
+"$YUI" "$S3" '作る (人:外から)' > /dev/null 2>&1 ||
+    { echo "NG   段 3 の下ごしらえに失敗しました"; exit 2; }
+SEC="$D/合言葉"
+# ★空白を含む合言葉にしてあります（語で切っていないことも一緒に確かめるため）
+printf 'この合言葉は 16 バイトを超えています\n' > "$SEC"
+SECVAL=$(cat "$SEC")
+S3PORT=39259 # ★ここは「立たない道」だけなので、口を取りません
+
+# -- 揃っていないときは開かないこと（入口を閉じる側へ倒す）
+out=$("$YUID" "$S3" --lan 127.0.0.2 --port "$S3PORT" --idle 1 2>&1)
+rc=$?
+check "★--lan だけでは立たないこと" "2" "$rc"
+has "--secret-file が要ります" "$out" "そのとき、何が足りないかを言うこと"
+
+out=$("$YUID" "$S3" --secret-file "$SEC" --port "$S3PORT" --idle 1 2>&1)
+rc=$?
+check "★--secret-file だけでも立たないこと（効かない設定を黙って受けない）" "2" "$rc"
+has "--lan と一緒に使います" "$out" "そのとき、なぜ断るのかを言うこと"
+hasnt "$SECVAL" "$out" "★断る文に合言葉そのものを出さないこと"
+
+out=$("$YUID" "$S3" --lan 0.0.0.0 --secret-file "$SEC" --port "$S3PORT" --idle 1 2>&1)
+rc=$?
+check "★0.0.0.0 は受け付けないこと（127.0.0.1 の口と重なる）" "2" "$rc"
+has "どのアドレスに出すか" "$out" "そのとき、何を書けばよいかを言うこと"
+
+out=$("$YUID" "$S3" --lan あどれす --secret-file "$SEC" --port "$S3PORT" --idle 1 2>&1)
+rc=$?
+check "アドレスとして読めないものを断ること" "2" "$rc"
+
+: > "$D/空の合言葉"
+out=$("$YUID" "$S3" --lan 127.0.0.2 --secret-file "$D/空の合言葉" --port "$S3PORT" --idle 1 2>&1)
+rc=$?
+check "★空の合言葉では立たないこと" "2" "$rc"
+has "空です" "$out" "そのとき、空だと言うこと"
+
+printf 'みじかい\n' > "$D/短い合言葉"
+out=$("$YUID" "$S3" --lan 127.0.0.2 --secret-file "$D/短い合言葉" --port "$S3PORT" --idle 1 2>&1)
+rc=$?
+check "★短すぎる合言葉では立たないこと（設定した気にさせない）" "2" "$rc"
+has "短すぎます" "$out" "そのとき、長さが足りないと言うこと"
+
+out=$("$YUID" "$S3" --lan 127.0.0.2 --secret-file "$D/無いファイル" --port "$S3PORT" --idle 1 2>&1)
+rc=$?
+check "合言葉のファイルが無いときに立たないこと" "2" "$rc"
+
+# -- 門が効くこと。★127.0.0.1 以外に出せるアドレスを探します。
+#    見つからない環境では、無理に通さず「見ていません」と出します（tests/README.md）。
+LANADDR=""
+LPORT=0
+i=39240
+for cand in 127.0.0.2 $(hostname -I 2> /dev/null) $(ipconfig getifaddr en0 2> /dev/null); do
+    [ -n "$cand" ] || continue
+    [ "$cand" = "127.0.0.1" ] && continue
+    while [ "$i" -lt 39258 ]; do
+        "$YUID" "$S3" --write --lan "$cand" --secret-file "$SEC" --port "$i" --idle 600 \
+            > "$D/log3" 2>&1 &
+        echo $! > "$D/pid3"
+        j=0
+        while [ "$j" -lt 50 ]; do
+            if grep -q "でも待っています" "$D/log3" 2> /dev/null; then break; fi
+            if ! kill -0 "$(cat "$D/pid3")" 2> /dev/null; then break; fi
+            j=$((j + 1))
+            sleep 0.1
+        done
+        if grep -q "でも待っています" "$D/log3" 2> /dev/null; then
+            LANADDR=$cand
+            LPORT=$i
+            break
+        fi
+        kill "$(cat "$D/pid3")" 2> /dev/null
+        : > "$D/pid3"
+        i=$((i + 1))
+    done
+    [ -n "$LANADDR" ] && break
+done
+
+if [ -z "$LANADDR" ]; then
+    echo "-- 見ていません: 段 3 の門（この環境では 127.0.0.1 以外に出せるアドレスが"
+    echo "   見つかりません。断る側〔上の 9 件〕は見ています）"
+else
+    has "★合言葉が要ります" "$(cat "$D/log3")" "LAN の口を開けたと言うこと"
+    hasnt "$SECVAL" "$(cat "$D/log3")" "★記録に合言葉を出さないこと"
+
+    # (a) 対照: 127.0.0.1 の口は、合言葉なしで読めること
+    out=$("$SAY" "$LPORT" '一覧 ()' 2>&1)
+    has '"name":"外から"' "$out" "★対照: 127.0.0.1 の口は合言葉なしで読めること"
+
+    # (b) ★LAN の口は、合言葉なしでは読めないこと
+    out=$("$SAY" "$LANADDR:$LPORT" '一覧 ()' 2>&1)
+    has "合言葉が要ります" "$out" "★LAN の口は合言葉なしでは読めないこと"
+    hasnt '"name":"外から"' "$out" "★そのとき中身を 1 行も返さないこと"
+
+    # (c) ★違う合言葉を断ること。そして「形が違う」と言い分けないこと
+    out=$("$SAY" "$LANADDR:$LPORT" '合言葉 ちがうあいことばです0123456789' 2>&1)
+    has "合言葉が要ります" "$out" "★違う合言葉を断ること"
+    hasnt '"kind":"pass"' "$out" "そのとき通ったと言わないこと"
+    hasnt '"name":"外から"' "$out" "そのとき中身を返さないこと"
+
+    # (d) 合う合言葉なら通り、そのあと読めること
+    #     ★1 回の問い合わせに 2 行 入れます（別々に送ると、話しかける道具が
+    #       1 回目の rc で止まるので、(f) の検出力がゼロになります）
+    out=$("$SAY" "$LANADDR:$LPORT" "合言葉 $SECVAL
+一覧 ()" 2>&1)
+    has '"kind":"pass","ok":true' "$out" "★合う合言葉を通すこと"
+    has '"name":"外から"' "$out" "★通ったあとは読めること"
+
+    # (e) ★合言葉のあとに名乗れば書けること（段 2 と組み合わさること）
+    out=$("$SAY" "$LANADDR:$LPORT" "合言葉 $SECVAL
+名乗る 外の機械
+作る (人:\"LAN から\")" 2>&1)
+    has '"kind":"hello"' "$out" "合言葉のあとに名乗れること"
+    has "作りました" "$out" "★合言葉＋名乗りで書けること"
+
+    # (f) ★断ったら、その接続ではもう受け付けないこと（総当たりを遅くするため）
+    out=$("$SAY" "$LANADDR:$LPORT" "ちがう行
+合言葉 $SECVAL" 2>&1)
+    has "合言葉が要ります" "$out" "1 行目を断ること"
+    hasnt '"kind":"pass"' "$out" "★断ったあと、同じ接続で合言葉を受け付けないこと"
+
+    if [ -s "$D/pid3" ]; then kill "$(cat "$D/pid3")" 2> /dev/null; fi
+fi
+
 # ---------------------------------------------------------------- 締め
 
 if [ "$ng" -eq 0 ]; then
