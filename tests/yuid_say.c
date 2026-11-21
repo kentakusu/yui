@@ -129,6 +129,9 @@ int main(int argc, char **argv) {
     sock_t s;
     struct sockaddr_in a;
     int port, i, rc = 0;
+    /* ★宛先。既定は 127.0.0.1（今までの呼び方をそのまま通すため） */
+    const char *host = "127.0.0.1";
+    static char hostbuf[64];
 
 #ifdef _WIN32
     {
@@ -143,11 +146,29 @@ int main(int argc, char **argv) {
     }
 #endif
     if (argc < 3) {
-        fprintf(stderr, "使い方: %s <ポート> <問い合わせ>… | --file <パス> | --raw <パス>\n",
+        fprintf(stderr,
+                "使い方: %s <ポート>|<アドレス:ポート> <問い合わせ>… "
+                "| --file <パス> | --raw <パス>\n",
                 argv[0]);
         return 2;
     }
-    port = atoi(argv[1]);
+    /*
+     * ★「アドレス:ポート」でも受けます（段 3 の口＝127.0.0.1 以外へ繋ぐため）。
+     *   ポートだけなら 127.0.0.1 で、今までの呼び方はそのまま通ります。
+     */
+    {
+        const char *colon = strrchr(argv[1], ':');
+        if (colon) {
+            size_t n = (size_t)(colon - argv[1]);
+            if (n == 0 || n >= sizeof hostbuf) return 2;
+            memcpy(hostbuf, argv[1], n);
+            hostbuf[n] = 0;
+            host = hostbuf;
+            port = atoi(colon + 1);
+        } else {
+            port = atoi(argv[1]);
+        }
+    }
     if (port <= 0 || port > 65535) return 2;
 
 #ifdef _WIN32
@@ -187,9 +208,18 @@ int main(int argc, char **argv) {
     memset(&a, 0, sizeof a);
     a.sin_family = AF_INET;
     a.sin_port = htons((unsigned short)port);
-    a.sin_addr.s_addr = htonl(0x7f000001u); /* ★INADDR_LOOPBACK は macOS で隠れます */
+    /*
+     * ★INADDR_LOOPBACK は macOS で隠れるので、既定も数値の文字で持っています。
+     * ★inet_addr ではなく inet_pton を使います（MSVC が inet_addr を C4996 で
+     *   警告します。黙らせるのではなく新しいほうに寄せます）。
+     */
+    if (inet_pton(AF_INET, host, &a.sin_addr) != 1) {
+        fprintf(stderr, "アドレスとして読めません: %s\n", host);
+        sock_close(s);
+        return 2;
+    }
     if (connect(s, (struct sockaddr *)&a, (int)sizeof a) != 0) {
-        fprintf(stderr, "繋がりません: 127.0.0.1:%d\n", port);
+        fprintf(stderr, "繋がりません: %s:%d\n", host, port);
         sock_close(s);
         return 1;
     }

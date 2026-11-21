@@ -19,6 +19,59 @@ SRCS = {
 BAKS = dict((k, os.path.join(tempfile.gettempdir(), k + ".orig")) for k in SRCS)
 
 BREAKS = [
+    # ------------------------------------------------- 段 3（LAN の口と合言葉）
+    (
+        "段 3: LAN の口で合言葉を見ない（口が開いていれば誰でも読める）",
+        [("        } else if (c->lan && !c->ok) {", "        } else if (0 && c->lan && !c->ok) {")],
+    ),
+    (
+        "段 3: LAN から来た接続を LAN だと覚えない（門が当たらない）",
+        [
+            (
+                "                    conns[nconn].lan = li; /* ★LAN の口から来たら 1（合言葉が要る） */",
+                "                    conns[nconn].lan = 0; /* ★LAN の口から来たら 1（合言葉が要る） */",
+            )
+        ],
+    ),
+    (
+        "段 3: 合言葉を照合しない（どんな値でも通す）",
+        [
+            (
+                "    unsigned char diff = (unsigned char)(ng != nw);",
+                "    unsigned char diff = 0;",
+            ),
+            (
+                "    for (i = 0; i < ng; i++) diff |= (unsigned char)(got[i] ^ (i < nw ? want[i] : 0));",
+                "    for (i = 0; i < 0; i++) diff |= (unsigned char)(got[i] ^ (i < nw ? want[i] : 0));",
+            ),
+        ],
+    ),
+    (
+        "段 3: 合言葉を間違えた接続を切らない（1 本で何度でも試せる）",
+        [("                failed = 1;\n                bye = 1;\n            }\n            free(got);",
+          "                failed = 1;\n                bye = 0;\n            }\n            free(got);")],
+    ),
+    (
+        "段 3: 短すぎる合言葉を受ける（設定した気になる）",
+        [("    if (n < 16) {", "    if (n < 0) {")],
+    ),
+    (
+        "段 3: --secret-file だけの設定を黙って受ける（効かない設定）",
+        [("    if (secret_path && !lan_addr) {", "    if (0 && secret_path && !lan_addr) {")],
+    ),
+    (
+        "段 3: 立つときの記録に合言葉そのものを出す",
+        [
+            (
+                '                "yuid: %s:%d でも待っています（★合言葉が要ります。"\n'
+                '                "ファイアウォールを開けるのは使う人です）\\n",\n'
+                "                lan_addr, port);",
+                '                "yuid: %s:%d でも待っています（合言葉は %s）（★合言葉が要ります。"\n'
+                '                "ファイアウォールを開けるのは使う人です）\\n",\n'
+                "                lan_addr, port, secret);",
+            )
+        ],
+    ),
     (
         "締めの行（end）を出さない",
         [

@@ -1,7 +1,8 @@
 /*
- * 結（yui）のデーモン — 段 1（読むだけ）。
+ * 結（yui）のデーモン（docs/デーモンの構想.md の段 1〜3）。
  *
- *   yuid ファイル [--port N] [--idle 秒]
+ *   yuid ファイル [--write] [--takeover] [--port N] [--idle 秒]
+ *                 [--lan <アドレス> --secret-file <パス>]
  *
  * ★何のためか: 結は「1 つのプロセスが開いて、閉じるまで持つ」形なので、
  *   同じファイルを複数のプロセスから使えません。このデーモンが 1 つだけ持ち、
@@ -25,7 +26,11 @@
  *     結の文はそれを読めません。**そういう名前には押さず、理由を言います。**
  *     黙って別の点に付けると、`結ぶ` が無い点を作るので静かに増えます。
  *
- * ★127.0.0.1 にしか出しません。LAN へ出すのは段 3 で、合言葉が要ります。
+ * ★既定は 127.0.0.1 にしか出しません。別の筐体から使うときだけ、--lan <アドレス>
+ *   で 2 つ目の口を開けます（段 3）。★LAN の口は --secret-file の合言葉が
+ *   合うまで、**読むことも通しません**（理由は privacy。結のファイルには
+ *   使う人の記録が丸ごと入りえるので、読めるだけで漏れます）。
+ *   ★ファイアウォールは開けません。開けるのは使う人です。
  *
  * ★終了コード: 0 正常に終わった / 2 使い方の誤り /
  *   **3 ほかが先に持っている**（口かファイルの錠。あとで建て直せばよい）/
@@ -45,8 +50,10 @@
  * ★`終わる` はこの接続を切るだけです。デーモンは止まりません（止めるのは
  *   Ctrl-C か、--idle の空き時間切れ）。
  *
- * ★まだ無いもの（docs/デーモンの構想.md の段 3・段 4）
- *   LAN の口と合言葉（段 3）。名前付きパイプ。公平さ（1 本で順に回します）。
+ * ★まだ無いもの（docs/デーモンの構想.md の段 4 と、段 3 の残り）
+ *   名前付きパイプ。公平さ（1 本で順に回します）。
+ *   段 3 の残り: ★TLS はありません（同じ LAN の中でも合言葉は平文で流れます）。
+ *   ★総当たりの回数も数えていません（間違えた接続を切るだけです）。
  */
 #define _POSIX_C_SOURCE 200809L
 #include "yui.h"
@@ -160,6 +167,14 @@ typedef struct {
      */
     char *me;
     int stamp; /* 1 なら帰属を押す。「印なし」と名乗れば 0（取り込み用） */
+    /*
+     * ★段 3: LAN の口から来た接続です。合言葉が合うまで、読むことも通しません。
+     *   127.0.0.1 から来た接続は lan=0 で、合言葉は要りません
+     *   （docs/デーモンの構想.md の「口」の表が正。理由は privacy で、
+     *     口が開いていれば同じ LAN に居る誰でも全部 読めるからです）。
+     */
+    int lan;
+    int ok; /* 1 なら合言葉が合った。lan=0 の接続では見ません */
 } Conn;
 
 /*
@@ -566,12 +581,98 @@ static int parse_hello(const char *line, char **name, int *stamp, const char **w
     return 1;
 }
 
+/* --------------------------------------------- 段 3: 合言葉（LAN の口だけ） */
+
+/*
+ * 合言葉を比べます。★合っているかも、長さが合っているかも、時間で漏らさない形で
+ *   比べます（短絡しない）。LAN に出す口なので、総当たりの足がかりを増やしません。
+ *   ★限界: 回す回数は「送られてきた側」の長さで決まるので、こちらの合言葉の
+ *     長さは漏れません。送った側の長さは送った本人が知っているので、問題になりません。
+ */
+static int secret_same(const char *got, const char *want) {
+    size_t ng = strlen(got), nw = strlen(want), i;
+    unsigned char diff = (unsigned char)(ng != nw);
+    for (i = 0; i < ng; i++) diff |= (unsigned char)(got[i] ^ (i < nw ? want[i] : 0));
+    return diff == 0;
+}
+
+/*
+ * 「合言葉 <値>」の行か。1 ならその行で、*val に値（NULL なら値が無い）。
+ * ★値は語で切らず、行末まで取ります（合言葉に空白を入れてよいので）。
+ *   引用符もほどきません（ほどくと、引用符自体を含む合言葉が書けません）。
+ */
+static int parse_secret(const char *line, char **val) {
+    static const char *KW = "合言葉";
+    const char *p = line, *e;
+    size_t kn = strlen(KW);
+    while (*p == ' ' || *p == '\t') p++;
+    if (strncmp(p, KW, kn) != 0) return 0;
+    if (p[kn] && p[kn] != ' ' && p[kn] != '\t') return 0;
+    *val = NULL;
+    p += kn;
+    while (*p == ' ' || *p == '\t') p++;
+    e = p + strlen(p);
+    /* ★末尾の復帰だけ外します（空白は合言葉の一部かもしれないので外しません） */
+    while (e > p && e[-1] == '\r') e--;
+    if (e == p) return 1;
+    *val = dup_n(p, (size_t)(e - p));
+    return 1;
+}
+
+/*
+ * 合言葉のファイルを読みます。末尾の改行・復帰だけ外します
+ * （★ほかの空白は外しません。合言葉の一部かもしれないので）。
+ * ★中身は画面にも記録にも出しません。断る理由だけを言います。
+ * 戻り値: malloc した文字列か、NULL（理由を *why に）。
+ */
+static char *read_secret(const char *p, const char **why) {
+    FILE *f;
+    char buf[4096];
+    size_t n;
+    char *out;
+    *why = NULL;
+    f = fopen(p, "rb");
+    if (!f) {
+        *why = "合言葉のファイルを開けません";
+        return NULL;
+    }
+    n = fread(buf, 1, sizeof buf - 1, f);
+    if (ferror(f)) {
+        fclose(f);
+        *why = "合言葉のファイルを読めません";
+        return NULL;
+    }
+    fclose(f);
+    buf[n] = 0;
+    while (n && (buf[n - 1] == '\n' || buf[n - 1] == '\r')) buf[--n] = 0;
+    if (n == 0) {
+        *why = "合言葉のファイルが空です";
+        return NULL;
+    }
+    /*
+     * ★16 バイト未満は断ります。LAN に出す口なので、総当たりで当たる長さの
+     *   合言葉を「設定した気になっている」状態を作らないためです。
+     */
+    if (n < 16) {
+        *why = "合言葉が短すぎます（16 バイト以上にしてください）";
+        return NULL;
+    }
+    out = dup_n(buf, n);
+    /*
+     * ★読んだ控えをここで消します。ただし**消える保証はありません**
+     *   （最適化で落とされることがあります）。気休めであって、守りではありません。
+     */
+    memset(buf, 0, sizeof buf);
+    if (!out) *why = "メモリが足りません";
+    return out;
+}
+
 /*
  * 問い合わせ 1 件を実行して、返す中身を out に組みます。
  * 戻り値: 0 = 続ける、1 = この接続を切る（終わる を受けた）
  */
 static int run_req(yui *db, Conn *c, const char *body, size_t blen, long max_rows,
-                   int writable, int max_stamp) {
+                   int writable, int max_stamp, const char *secret) {
     size_t i = 0;
     unsigned long lineno = 0;
     int failed = 0, bye = 0;
@@ -621,6 +722,33 @@ static int run_req(yui *db, Conn *c, const char *body, size_t blen, long max_row
             buf_json_str(out, msg);
             buf_str(out, "}\n");
             failed = 1;
+        } else if (c->lan && !c->ok) {
+            /*
+             * ★段 3: LAN の口は、合言葉が合うまで何も通しません（読むことも）。
+             *   ここを「書くときだけ」にすると、privacy が守れません——結の
+             *   ファイルには使う人の記録が丸ごと入りえるので、読めるだけで漏れます。
+             */
+            char *got = NULL;
+            int form = parse_secret(line, &got);
+            if (form && got && secret && secret_same(got, secret)) {
+                c->ok = 1;
+                buf_str(out, "{\"kind\":\"pass\",\"ok\":true}\n");
+            } else {
+                /*
+                 * ★合言葉そのものは返しません・記録にも出しません。
+                 * ★そして「形が違う」と「値が違う」を言い分けません。言い分けると、
+                 *   当てに来た相手に「形は合っている」を教えます。
+                 * ★1 本の接続で何度も試させないので、ここで切ります（bye）。
+                 *   繋ぎ直させるぶんだけ、総当たりが遅くなります。
+                 */
+                buf_str(out, "{\"kind\":\"error\",\"text\":");
+                buf_json_str(out, "合言葉が要ります（LAN の口です）。"
+                                  "最初の 1 行で「合言葉 <値>」を送ってください");
+                buf_str(out, "}\n");
+                failed = 1;
+                bye = 1;
+            }
+            free(got);
         } else if (parse_hello(line, &hello_name, &hello_stamp, &hello_why)) {
             /* ★名乗りはデーモンが受け取ります。結には渡しません */
             if (!hello_name) {
@@ -781,6 +909,14 @@ static void usage(const char *me) {
             "              ★片付けるのは「この機械・この土台が書いた錠で、pid が居ない」\n"
             "              ときだけ。生きている錠・別の機械の錠・別の土台（Windows と\n"
             "              WSL など）の錠・os= が無い錠は片付けません（3 で断ります）。\n"
+            "  --lan       127.0.0.1 のほかに、このアドレスでも待ちます（段 3）。\n"
+            "              ★--secret-file が無いと立ちません（後ろに何も居ない穴を\n"
+            "              開けて忘れるのを防ぐため）。0.0.0.0 は受け付けません\n"
+            "              （127.0.0.1 の口と重なります）。例 --lan 192.168.1.23\n"
+            "  --secret-file 合言葉を書いた 1 ファイル（★リポジトリに入れない所に置く）。\n"
+            "              LAN の口から来た接続は、最初の 1 行で「合言葉 <値>」を\n"
+            "              送るまで、読むことも通しません。\n"
+            "              ★中身は画面にも記録にも出しません。16 バイト未満は断ります\n"
             "  --port      既定 %d\n"
             "  --idle      誰も繋いでいない状態がこの秒数 続いたら終わります（既定 0＝終わらない）\n"
             "  --max-rows  1 回の問い合わせで返す行の上限（既定 %d・0 で外す）\n"
@@ -829,7 +965,7 @@ int main(int argc, char **argv) {
     Conn conns[MAX_CONN];
     sock_t lis = SOCK_BAD;
     struct sockaddr_in addr;
-    int i, port = DEFAULT_PORT, idle = 0, nconn = 0, rc = 0, yes = 1;
+    int i, li, port = DEFAULT_PORT, idle = 0, nconn = 0, rc = 0, yes = 1;
     long max_rows = DEFAULT_MAX_ROWS;
     int writable = 0; /* --write で 1。既定は読むだけです */
     int takeover = 0; /* --takeover で 1。残骸の錠を片付けます */
@@ -843,6 +979,11 @@ int main(int argc, char **argv) {
     const char *path = NULL;
     time_t last = time(NULL);
     char name[64];
+    /* ★段 3: LAN の口。既定は閉じています（--lan と --secret-file の両方で開きます） */
+    sock_t lan_lis = SOCK_BAD;
+    const char *lan_addr = NULL;
+    const char *secret_path = NULL;
+    char *secret = NULL;
 
 #ifdef _WIN32
     {
@@ -878,6 +1019,10 @@ int main(int argc, char **argv) {
             if (max_stamp < 1) max_stamp = 1;
         } else if (strcmp(argv[i], "--max-out") == 0 && i + 1 < argc) {
             max_out = strtoul(argv[++i], NULL, 10);
+        } else if (strcmp(argv[i], "--lan") == 0 && i + 1 < argc) {
+            lan_addr = argv[++i];
+        } else if (strcmp(argv[i], "--secret-file") == 0 && i + 1 < argc) {
+            secret_path = argv[++i];
         } else if (argv[i][0] == '-') {
             usage(argv[0]);
             return 2;
@@ -894,6 +1039,52 @@ int main(int argc, char **argv) {
     }
     /* ★関所は切る線より小さくします（読むのをやめる前に切る形にしないため） */
     if (high_water > max_out / 2) high_water = max_out / 2;
+
+    /*
+     * ★段 3 の入口は、揃っていないときに「開かない」側へ倒します。
+     *   docs/デーモンの構想.md:「後ろに何も居ない穴を開けて忘れる方が危ない」。
+     */
+    if (lan_addr && !secret_path) {
+        fputs("yuid: --lan には --secret-file が要ります"
+              "（合言葉を持たない口は開けません）\n", stderr);
+        return 2;
+    }
+    if (secret_path && !lan_addr) {
+        /* ★効かない設定を黙って受けると、「合言葉を付けた」と思い込ませます */
+        fputs("yuid: --secret-file は --lan と一緒に使います"
+              "（127.0.0.1 の口では合言葉を見ません）\n", stderr);
+        return 2;
+    }
+    if (lan_addr) {
+        const char *why = NULL;
+        if (strcmp(lan_addr, "0.0.0.0") == 0 || strcmp(lan_addr, "*") == 0 ||
+            strcmp(lan_addr, "::") == 0) {
+            fprintf(stderr,
+                    "yuid: --lan %s は受け付けません。"
+                    "どのアドレスに出すかを書いてください"
+                    "（127.0.0.1 の口と重なります）\n",
+                    lan_addr);
+            return 2;
+        }
+        /*
+         * ★inet_addr ではなく inet_pton を使います。MSVC が inet_addr を
+         *   deprecated として警告するので（C4996・実測）、黙らせるのではなく
+         *   新しいほうに寄せます。どちらの土台にも在ります。
+         */
+        {
+            struct in_addr tmp;
+            if (inet_pton(AF_INET, lan_addr, &tmp) != 1) {
+                fprintf(stderr, "yuid: --lan %s はアドレスとして読めません\n", lan_addr);
+                return 2;
+            }
+        }
+        secret = read_secret(secret_path, &why);
+        if (!secret) {
+            /* ★言うのは理由だけ。中身は出しません */
+            fprintf(stderr, "yuid: %s: %s\n", why ? why : "合言葉を読めません", secret_path);
+            return 2;
+        }
+    }
 
     memset(conns, 0, sizeof conns);
     signal(SIGINT, on_signal);
@@ -1007,10 +1198,53 @@ int main(int argc, char **argv) {
         sock_close(lis);
         return 1;
     }
+    /*
+     * ★段 3 の口は、ファイルの錠を取ったあとに開きます。錠で断られる筋のほうが
+     *   よく起きるので、先にそこを通してから穴を開けます（開けたあとに失敗して
+     *   閉じ忘れる道を作らないため）。
+     */
+    if (lan_addr) {
+        struct sockaddr_in la;
+        lan_lis = socket(AF_INET, SOCK_STREAM, 0);
+        if (lan_lis == SOCK_BAD) {
+            fputs("yuid: LAN の口を作れません\n", stderr);
+            yui_close(db);
+            sock_close(lis);
+            return 1;
+        }
+#ifdef _WIN32
+        (void)setsockopt(lan_lis, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, (const char *)&yes,
+                         sizeof yes);
+#else
+        (void)setsockopt(lan_lis, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof yes);
+#endif
+        memset(&la, 0, sizeof la);
+        la.sin_family = AF_INET;
+        la.sin_port = htons((unsigned short)port);
+        /* ★ここへ来る前に inet_pton で読めることを確かめてあります */
+        (void)inet_pton(AF_INET, lan_addr, &la.sin_addr);
+        if (bind(lan_lis, (struct sockaddr *)&la, (int)sizeof la) != 0 ||
+            listen(lan_lis, 8) != 0) {
+            fprintf(stderr,
+                    "yuid: %s:%d を使えません。そのアドレスがこの機械のものか、"
+                    "もう 1 つ立っていないかを見てください\n",
+                    lan_addr, port);
+            sock_close(lan_lis);
+            yui_close(db);
+            sock_close(lis);
+            return 3;
+        }
+    }
+
     if (yui_notice(db)) fprintf(stderr, "yuid: お知らせ: %s\n", yui_notice(db));
     fprintf(stderr,
             "yuid: 127.0.0.1:%d で待っています（%s・返りは %ld 行まで）: %s\n", port,
             writable ? "名乗れば書けます" : "読むだけ", max_rows, path);
+    if (lan_addr)
+        fprintf(stderr,
+                "yuid: %s:%d でも待っています（★合言葉が要ります。"
+                "ファイアウォールを開けるのは使う人です）\n",
+                lan_addr, port);
 
     while (!stop_now) {
         fd_set rd, wr;
@@ -1022,6 +1256,12 @@ int main(int argc, char **argv) {
 #ifndef _WIN32
         maxfd = (int)lis;
 #endif
+        if (lan_lis != SOCK_BAD) {
+            FD_SET(lan_lis, &rd);
+#ifndef _WIN32
+            if ((int)lan_lis > maxfd) maxfd = (int)lan_lis;
+#endif
+        }
         for (i = 0; i < nconn; i++) {
             /*
              * ★溜まりが多い接続からは、新しい問い合わせを読みません。
@@ -1054,8 +1294,12 @@ int main(int argc, char **argv) {
             continue;
         }
 
-        if (FD_ISSET(lis, &rd)) {
-            sock_t s = accept(lis, NULL, NULL);
+        /* ★口は 2 つ（127.0.0.1 と LAN）。来た口を接続に覚えさせます（lan） */
+        for (li = 0; li < 2; li++) {
+            sock_t from = li ? lan_lis : lis;
+            sock_t s;
+            if (from == SOCK_BAD || !FD_ISSET(from, &rd)) continue;
+            s = accept(from, NULL, NULL);
             if (s != SOCK_BAD) {
                 if (nconn >= MAX_CONN) {
                     /* ★ここだけは待って送ります（1 行だけなので詰まりません）。
@@ -1068,6 +1312,7 @@ int main(int argc, char **argv) {
                 } else {
                     memset(&conns[nconn], 0, sizeof conns[nconn]);
                     conns[nconn].s = s;
+                    conns[nconn].lan = li; /* ★LAN の口から来たら 1（合言葉が要る） */
                     set_nonblock(s);
                     nconn++;
                     last = time(NULL);
@@ -1110,7 +1355,7 @@ int main(int argc, char **argv) {
                     }
                     conns[i].bye =
                         run_req(db, &conns[i], body, blen, max_rows, writable,
-                                max_stamp);
+                                max_stamp, secret);
                     used = (size_t)(body - conns[i].in.p) + blen;
                     buf_drop(&conns[i].in, used);
                 }
@@ -1148,6 +1393,12 @@ int main(int argc, char **argv) {
         free(conns[i].me);
     }
     sock_close(lis);
+    if (lan_lis != SOCK_BAD) sock_close(lan_lis);
+    if (secret) {
+        /* ★記憶から消します（消える保証はありません。read_secret に理由） */
+        memset(secret, 0, strlen(secret));
+        free(secret);
+    }
     if (yui_close(db) != YUI_OK) {
         fputs("yuid: 閉じるときの書き出しに失敗しました\n", stderr);
         rc = 1;

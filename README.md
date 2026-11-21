@@ -470,6 +470,63 @@ Register-ScheduledTask -TaskName "yui-daemon" -Action $act -Trigger $trg -Settin
   Select-String -Path "C:\…\yuid.log" -Pattern "新しいファイルとして始めました" | Select-Object -Last 3
   ```
 
+### 別の機械から使う（`--lan` と合言葉）
+
+★**既定では `127.0.0.1` にしか出しません。**別の筐体から使うときだけ、2 つ目の口を開けます。
+
+| 口 | 届く相手 | 合言葉 |
+|---|---|---|
+| `127.0.0.1` | その機械と、**同じ PC の WSL2**（`networkingMode=Mirrored` のとき） | 不要 |
+| `--lan` のアドレス | 同じ LAN の**別の機械** | ★**必須** |
+
+★**同じ PC の WSL2 に `--lan` は要りません。**`127.0.0.1` が共有されるので、今のままで繋がります（[実測](docs/デーモンの構想.md)）。**`--lan` が要るのは別の筐体だけです。**
+
+合言葉を、★**リポジトリに入れない所**に 1 ファイル置きます（16 バイト以上）。
+
+```sh
+# Linux / macOS
+umask 077; head -c 32 /dev/urandom | base64 > ~/.yui-secret
+```
+
+```powershell
+# Windows（5.1 でも 7 でも通ります）
+$b = New-Object byte[] 32
+(New-Object Security.Cryptography.RNGCryptoServiceProvider).GetBytes($b)
+[IO.File]::WriteAllText("$env:USERPROFILE\.yui-secret", [Convert]::ToBase64String($b))
+```
+
+```sh
+./yuid 知識.yui --write --port 39200 --lan 192.168.1.23 --secret-file ~/.yui-secret
+```
+
+LAN の口から繋いだら、★**最初の 1 行で合言葉を送ります。**合うまで、**読むことも通りません。**
+
+```
+送る:  <長さ>\n合言葉 <値>
+返る:  {"kind":"pass","ok":true}
+       {"kind":"end","rc":0}
+```
+
+- ★**合言葉を必須にしているのは privacy のためです。**結のファイルには使う人の記録が丸ごと入りえるので、**読めるだけで漏れます。**だから「書くときだけ」ではなく、**読むことも門の内側**に置いています
+- ★**揃っていないと立ちません**（開かない側へ倒します）。`--lan` だけ／`--secret-file` だけ／`0.0.0.0`／空の合言葉／16 バイト未満は、どれも **`2` で断ります**
+- ★**断る文は「形が違う」と「値が違う」を言い分けません。**言い分けると、当てに来た相手に「形は合っている」を教えます
+- ★**間違えた接続は、その場で切ります。**繋ぎ直させるぶんだけ、総当たりが遅くなります
+- ★**合言葉は画面にも記録にも出しません**
+- ★**TLS はありません。**同じ LAN の中でも**合言葉は平文で流れます。****その LAN に誰が居るかを数えてから**開けてください（客用の Wi-Fi が同じ網なら、そこからも届きます）
+
+#### ファイアウォール（★開けるのは使う人です）
+
+★**結の側ではこの設定を触りません**（システムの安全の設定なので）。★**そして段 3 ができるまで開けません**——後ろに何も居ない穴を開けて忘れる方が危ないからです。開けるときは**範囲を狭めること**が要点です。
+
+```powershell
+# 管理者の PowerShell で。最後の範囲は自分の LAN に直してください
+New-NetFirewallRule -DisplayName "yui-daemon" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 39200 -Profile Private -RemoteAddress 192.168.0.0/24
+```
+
+- ★**`-RemoteAddress` を省かないこと。**省くと、あとで別の網に繋いだとき（外の Wi-Fi など）**その網の誰にでも届きます。**`-Profile Private` も同じ理由です
+- 消すときは `Remove-NetFirewallRule -DisplayName "yui-daemon"`
+- ★**開けたあとは、別の機械から実際に繋がるかを確かめてください。**待ち受けと許可のどちらが欠けていても、**どちらも同じ「繋がらない」になります**
+
 ### 気をつけること（デーモン）
 
 - ★**デーモンを立てている間、CLI からは同じファイルを開けません。**デーモンが錠を持ちます。**全員がデーモンを通るか、全員が CLI を使うかの、どちらかです**
@@ -477,7 +534,7 @@ Register-ScheduledTask -TaskName "yui-daemon" -Action $act -Trigger $trg -Settin
 - 同時に繋げるのは 16 本までです（超えたら理由を言って断ります）
 - **読まないクライアントで止まりません。**待たずに送り、溜まりが 1 MB を超えたらその接続から新しい問い合わせを読まず、**`--max-out`（既定 8 MB）を超えたらその接続を切ります**（他のクライアントを守るため。切ったことは標準エラーに出ます）
 - ★**公平さはありません。**1 本で順に回すので、重い問い合わせの間は他が順番を待ちます（止まるのではなく、待つだけです）
-- ★**`127.0.0.1` にしか出しません。**`networkingMode=Mirrored` の環境では、これで Windows と WSL2 の両方から使えます（既定の NAT では共有されません）
+- ★**既定では `127.0.0.1` にしか出しません。**`networkingMode=Mirrored` の環境では、これで Windows と WSL2 の両方から使えます（既定の NAT では共有されません）。別の筐体から使うときだけ [`--lan` と合言葉](#別の機械から使う--lan-と合言葉)で 2 つ目の口を開けます
 - ★**異常終了すると `<パス>.錠` が残ります。**合図（Ctrl-C / SIGTERM）を受けたときは外します。常駐させるなら [`--takeover`](#常駐させる--takeover) を付けてください
 
 ## 言葉
