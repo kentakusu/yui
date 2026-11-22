@@ -83,6 +83,16 @@ BREAKS = [
         ],
     ),
     (
+        "段 3: loopback では合言葉を照合せず黙って通す",
+        [('            if (!secret || (lo_got && secret_same(lo_got, secret))) {',
+          '            if (1) {')],
+    ),
+    (
+        "段 3: loopback でも合わなければ接続を切る",
+        [('                buf_str(out, "}\\n");\n                failed = 1;\n            }\n            free(lo_got);',
+          '                buf_str(out, "}\\n");\n                failed = 1;\n                bye = 1;\n            }\n            free(lo_got);')],
+    ),
+    (
         "締めの行（end）を出さない",
         [
             (

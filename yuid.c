@@ -688,6 +688,7 @@ static int run_req(yui *db, Conn *c, const char *body, size_t blen, long max_row
         char *line;
         int rc;
         char *hello_name = NULL;
+        char *lo_got = NULL; /* loopback に来た「合言葉 …」の値 */
         int hello_stamp = 1;
         const char *hello_why = NULL;
         while (j < blen && body[j] != '\n') j++;
@@ -763,6 +764,26 @@ static int run_req(yui *db, Conn *c, const char *body, size_t blen, long max_row
                 bye = 1;
             }
             free(got);
+        } else if (!c->lan && parse_secret(line, &lo_got)) {
+            /*
+             * ★127.0.0.1 の口は合言葉を見ません。でも「合言葉 …」が来たら受け取ります。
+             *   ★使う側が「この口は合言葉が要るか」を知らないと動かないのは、良い作りでは
+             *   ありません（2026-11-22: 紡が loopback に合言葉を送り、「知らない言葉です」で
+             *   止まりました。★設定に合言葉を書いたせいで動かない形は、いちばん分かりにくい）。
+             * ★合言葉が設定されていれば照合します。黙って通すと「確かめたつもり」になるためです。
+             * ★ただし合わなくても切りません。この口はもともと合言葉を要らないので、
+             *   切ると「今まで通っていた人」が止まります。文面にそう書きます。
+             */
+            if (!secret || (lo_got && secret_same(lo_got, secret))) {
+                buf_str(out, "{\"kind\":\"pass\",\"ok\":true}\n");
+            } else {
+                buf_str(out, "{\"kind\":\"error\",\"text\":");
+                buf_json_str(out, "合言葉が合いません。"
+                                  "（★この口は 127.0.0.1 なので合言葉は要りません。このまま続けられます）");
+                buf_str(out, "}\n");
+                failed = 1;
+            }
+            free(lo_got);
         } else if (parse_hello(line, &hello_name, &hello_stamp, &hello_why)) {
             /* ★名乗りはデーモンが受け取ります。結には渡しません */
             if (!hello_name) {
