@@ -3438,6 +3438,50 @@ static int pid_alive(unsigned long pid) {
     return errno == ESRCH ? 0 : -1; /* EPERM は「別の人のものが居る」 */
 #endif
 }
+
+/*
+ * 起動時刻の判定に使う余裕（秒）。
+ * ★起動時刻は推定で、NTP が時計を直すと前後にずれます。ずれても
+ *   「生きている錠を壊さない」側へ倒すために引きます
+ *   （残骸を見逃すほうが、生きている錠を壊すより安い）。
+ */
+#define LOCK_BOOT_SLACK 600
+
+/*
+ * OS が起動した時刻（epoch 秒）。0 = 測れない。
+ *
+ * ★何のために要るか: pid は再利用されます。再起動をまたいで残った錠の pid が
+ *   別のプロセスに付くと、pid_alive は 1 を返し、「持ち主がまだ居ます」に化けます。
+ *   ⇒ 起動より前に書かれた錠は、pid が生きていても持ち主は死んでいます。
+ *
+ * ★0（測れない）を「起動していない」と混ぜないこと。混ぜると、起動時刻が
+ *   取れない土台で全部の錠が残骸に見えます。呼ぶ側で 0 を外してください。
+ * ★mac と wasm では測りません（0 を返す＝今までの挙動のまま）。測る手段が
+ *   土台ごとに違い、確かめられない道を足すと、生きている錠を壊す側へ倒れます。
+ */
+static long long lock_boot_time(void) {
+#ifdef _WIN32
+    /* ★GetTickCount64 は起動からのミリ秒。今から引いて起点を出します */
+    return (long long)time(NULL) - (long long)(GetTickCount64() / 1000u);
+#elif defined(__linux__)
+    {
+        FILE *f = fopen("/proc/stat", "r");
+        char line[256];
+        long long bt = 0;
+        if (!f) return 0;
+        while (fgets(line, sizeof line, f)) {
+            if (strncmp(line, "btime ", 6) == 0) {
+                bt = strtoll(line + 6, NULL, 10);
+                break;
+            }
+        }
+        fclose(f);
+        return bt;
+    }
+#else
+    return 0;
+#endif
+}
 #endif /* __EMSCRIPTEN__ でない */
 
 /* 錠の本文から 行頭の key= の値を取ります。1 = 取れた */
@@ -3507,7 +3551,25 @@ int yui_lock_look(const char *path, int *out) {
     *out = YUI_LOOK_LIVE;
 #else
     /* ★-1（測れない）を 0（居ない）と混ぜないこと。混ぜると生きている錠を壊します */
-    *out = pid_alive(strtoul(pidbuf, NULL, 10)) == 0 ? YUI_LOOK_STALE : YUI_LOOK_LIVE;
+    if (pid_alive(strtoul(pidbuf, NULL, 10)) == 0) {
+        *out = YUI_LOOK_STALE;
+    } else {
+        /*
+         * ★ここに来るのは「pid が居る」か「測れない」のどちらかです。
+         *   ★pid は再利用されます。再起動をまたいだ錠の pid が別のプロセスに
+         *   付くと、上は 1（居る）を返し、残骸が永久に片付きません。
+         *   ⇒ 起動より前に書かれた錠は、pid が何を返しても残骸です。
+         * ★起動時刻が測れない土台（0 が返る）では、今までどおり pid だけで
+         *   決めます。測れないことを残骸の根拠にしません。
+         */
+        char sincebuf[64];
+        long long boot = lock_boot_time();
+        long long since = 0;
+        if (boot > 0 && lock_field(body, "since", sincebuf, sizeof sincebuf))
+            since = strtoll(sincebuf, NULL, 10);
+        *out = (since > 0 && since < boot - LOCK_BOOT_SLACK) ? YUI_LOOK_STALE
+                                                             : YUI_LOOK_LIVE;
+    }
 #endif
     return YUI_OK;
 }

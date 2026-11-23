@@ -675,6 +675,57 @@ hasnt "--takeover を付けてください" "$out" "★os= が無い錠に --tak
 check "★そのとき錠が残っていること" "0" "$?"
 rm -f "$FT.錠"
 
+# (g) ★再起動をまたいだ錠は、pid が生きていても片付けること。
+#   ★pid は再利用されます。再起動のあと、錠に書かれた pid が別のプロセスに
+#     付くことがあり、pid だけ見る判定は「持ち主がまだ居ます」と読みます。
+#     ⇒ 残骸が永久に片付かず、常駐が黙って立たなくなります。
+#   ★判定は「錠の since が OS の起動時刻より前か」です。起動より前に書かれた
+#     錠の持ち主は、pid が何を返しても死んでいます。
+#   ★対照は上の (c) です（since が今のものは壊さない）。★ここだけ見ても、
+#     「何をやっても片付ける」形と区別が付きません。両方 要ります。
+#   ★起動時刻が測れない土台（mac・wasm）では今までどおり pid だけで決めるので、
+#     見ていません。
+case "$MYOS" in
+    win | linux)
+        # ★pid には**この試験自身の pid** を使います（確実に生きています）。
+        #   since=1 は 1970 年＝どの起動よりも前です。
+        printf 'yui-lock 1\nname=再起動の前の結\nmachine=%s\nos=%s\npid=%s\nsince=1\ntag=0\n' \
+            "$MYMACH" "$MYOS" "$$" > "$FT.錠"
+        "$YUID" "$FT" --write --takeover --port "$TPORT" --idle 600 > "$D/tlog7" 2>&1 &
+        echo $! > "$TPID"
+        j=0
+        while [ "$j" -lt 50 ]; do
+            if grep -q "で待っています" "$D/tlog7" 2> /dev/null; then break; fi
+            if ! kill -0 "$(cat "$TPID")" 2> /dev/null; then break; fi
+            j=$((j + 1))
+            sleep 0.1
+        done
+        out=$(cat "$D/tlog7")
+        has "残骸の錠を片付けて建て直します" "$out" \
+            "★再起動をまたいだ錠は、pid が生きていても片付けること"
+        has "で待っています" "$out" "★そのとき立つこと"
+        # ★片付けるのは錠だけです。pid の今の持ち主に手を出してはいけません
+        kill -0 "$$" 2> /dev/null
+        check "★片付けても、pid の今の持ち主（この試験自身）は無事なこと" "0" "$?"
+        NEWPID=$(sed -n 's/^pid=//p' "$FT.錠" 2> /dev/null | head -1)
+        [ -n "$NEWPID" ] && [ "$NEWPID" != "$$" ]
+        check "★新しい錠の持ち主が、建て直したデーモンになっていること" "0" "$?"
+        kill "$(cat "$TPID")" 2> /dev/null
+        j=0
+        while [ "$j" -lt 50 ]; do
+            [ -f "$FT.錠" ] || break
+            j=$((j + 1))
+            sleep 0.1
+        done
+        : > "$TPID"
+        rm -f "$FT.錠"
+        ;;
+    *)
+        echo "-- 見ていません: 再起動をまたいだ錠（この土台では OS の起動時刻を"
+        echo "   測らないので、今までどおり pid だけで決めます。断る側〔(c)〕は見ています）"
+        ;;
+esac
+
 # ------------------------------------------------- 段 3: LAN の口と合言葉
 #
 # 設計の正は docs/デーモンの構想.md の「口」の表です。
